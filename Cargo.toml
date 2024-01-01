@@ -1,0 +1,16 @@
+[package]
+name = "ramble_bot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-channel = "2.1.1"
+dotenvy = "0.15.7"
+fake-tty = "0.3.1"
+log = "0.4.20"
+pretty_env_logger = "0.5.0"
+teloxide = { version = "0.12.2", features = ["macros"] }
+thiserror = "1.0.53"
+tokio = { version = "1.35.1", features = ["full"] }
