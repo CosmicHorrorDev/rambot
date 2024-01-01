@@ -64,7 +64,6 @@ async fn handle_message(
     let mut job_handle = transcribers
         .submit_job(bot.clone(), voice_file_id.to_owned())
         .await;
-    let mut current_transcription = String::new();
     // TODO: skip useless updates by eagerly receiving more events to start
     while let Some(update) = job_handle.recv().await {
         match update {
@@ -80,7 +79,6 @@ async fn handle_message(
                     .filter_map(utils::srt_like_to_telegram_ts_line)
                     .collect::<Vec<_>>()
                     .join("\n");
-                current_transcription = telegram_formatted.clone();
                 let formatted_resp = format!("In progress...\n{telegram_formatted}\n[...]");
                 // TODO: handle this more gracefully. It errors when the message wasn't
                 // actually modified
@@ -99,7 +97,6 @@ async fn handle_message(
             }
         }
     }
-    let _ = bot_msg.edit_text(&current_transcription).await;
 
     Ok(())
 }
