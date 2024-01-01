@@ -61,40 +61,32 @@ async fn handle_message(
         .await
         .unwrap();
 
-    let mut job_handle = transcribers
+    let downloading_fut = transcribers
         .submit_job(bot.clone(), voice_file_id.to_owned())
         .await;
-    // TODO: skip useless updates by eagerly receiving more events to start
-    while let Some(update) = job_handle.recv().await {
-        match update {
-            transcriber::Update::Downloading => {
-                let _ = bot_msg.edit_text("Downloading...").await;
+    let mut transcribe_fut = downloading_fut.await.unwrap().unwrap();
+    let _ = bot_msg.edit_text("Downloading...").await;
+    loop {
+        match transcribe_fut.await.unwrap() {
+            transcriber::Transcribing::InProgress {
+                next,
+                transcription,
+            } => {
+                transcribe_fut = next;
+                if transcription.trim().is_empty() {
+                    let _ = bot_msg.edit_text("Transcribing...").await;
+                } else {
+                    let telegram_formatted = utils::srt_like_to_telegram_ts(&transcription);
+                    let formatted_resp = format!("In progress...\n{telegram_formatted}\n[...]");
+                    let _ = bot_msg.edit_text(&formatted_resp).await;
+                }
             }
-            transcriber::Update::StartedTranscription => {
-                let _ = bot_msg.edit_text("Transcribing...").await;
-            }
-            transcriber::Update::CurrentTranscription(transcription) => {
-                let telegram_formatted = transcription
-                    .lines()
-                    .filter_map(utils::srt_like_to_telegram_ts_line)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let formatted_resp = format!("In progress...\n{telegram_formatted}\n[...]");
-                // TODO: handle this more gracefully. It errors when the message wasn't
-                // actually modified
-                let _ = bot_msg.edit_text(&formatted_resp).await;
-            }
-            transcriber::Update::Finished(full) => {
-                let telegram_formatted = full
-                    .lines()
-                    .filter_map(utils::srt_like_to_telegram_ts_line)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            transcriber::Transcribing::Finished(transcription) => {
+                let telegram_formatted = utils::srt_like_to_telegram_ts(&transcription);
                 let _ = bot_msg.edit_text(&telegram_formatted).await;
+                break;
             }
-            transcriber::Update::ErroredOut => {
-                let _ = bot_msg.edit_text("Errored out >:V").await;
-            }
+            transcriber::Transcribing::Error => todo!(),
         }
     }
 
