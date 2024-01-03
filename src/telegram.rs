@@ -2,8 +2,9 @@
 
 use std::path::Path;
 
+use crate::Result;
+
 use teloxide::{net::Download, payloads, requests::Requester, types};
-use thiserror::Error as ThisError;
 
 #[derive(Clone)]
 pub struct Bot(pub teloxide::Bot);
@@ -20,6 +21,7 @@ impl Bot {
     }
 
     pub async fn set_my_commands(&self, commands: Vec<types::BotCommand>) -> Result<()> {
+        log::debug!("Setting telegram commands");
         self.0.set_my_commands(commands).await?;
         Ok(())
     }
@@ -30,6 +32,7 @@ impl Bot {
         reply_to: types::MessageId,
         text: &str,
     ) -> Result<Message> {
+        log::debug!("Sending reply to message {reply_to} text:\n{text}");
         let msg = <teloxide::Bot as Requester>::SendMessage::new(
             self.0.clone(),
             payloads::SendMessage {
@@ -47,6 +50,7 @@ impl Bot {
     }
 
     pub async fn download_file(&self, output_path: &Path, file_id: String) -> Result<()> {
+        log::debug!("Downloading file {} to {}", file_id, output_path.display());
         let file_meta = self.0.get_file(file_id).await?;
         let mut file = tokio::fs::File::create(output_path).await?;
         self.0.download_file(&file_meta.path, &mut file).await?;
@@ -54,6 +58,7 @@ impl Bot {
     }
 }
 
+#[derive(Clone)]
 pub struct Message {
     bot: teloxide::Bot,
     msg_id: types::MessageId,
@@ -61,23 +66,36 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn new(bot: Bot, msg: &types::Message) -> Self {
+        Self {
+            bot: bot.0,
+            msg_id: msg.id,
+            chat_id: msg.chat.id,
+        }
+    }
+
     pub async fn edit_text(&self, text: &str) -> Result<()> {
+        log::debug!(
+            "Editing message {} len {} snippet:\n{}",
+            self.msg_id,
+            text.len(),
+            if text.chars().count() > 100 {
+                text.chars().take(100 - 3).chain("...".chars()).collect()
+            } else {
+                text.to_owned()
+            }
+        );
         self.bot
             .edit_message_text(self.chat_id, self.msg_id, text)
             .await?;
         Ok(())
     }
-}
 
-// TODO: just make a crate-wide error
-type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, ThisError)]
-pub enum Error {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Telegram API download error: {0}")]
-    Download(#[from] teloxide::DownloadError),
-    #[error("Telegram API request error: {0}")]
-    Request(#[from] teloxide::RequestError),
+    pub async fn reply(&self, text: &str) -> Result<()> {
+        let bot_ext = Bot::from(self.bot.clone());
+        bot_ext
+            .send_message(self.chat_id, self.msg_id, text)
+            .await?;
+        Ok(())
+    }
 }

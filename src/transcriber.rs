@@ -1,75 +1,177 @@
-use std::{io::Read, path::Path, process::Stdio};
+use std::{io::Read, path::Path, process::Stdio, sync::Arc};
 
-use crate::telegram::Bot;
+use crate::{telegram::Bot, Error, Result};
 
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinSet,
+};
 
-struct Job {
+// TODO: move all of this under a `state_machine` module
+// TODO: wrap non-fut so that we can expose a meaningful error directly?
+// All the *Fut and non-*Fut values here represent the two sides of the transcription process'
+// state machine where the *Fut side automatically emits updates to the non-*Fut side that expand
+// out to follow the state machine's flow
+#[must_use]
+struct JobFut {
+    next: oneshot::Sender<DownloadStarted>,
+    meta: JobMeta,
+}
+
+struct JobMeta {
     bot: Bot,
     voice_file_id: String,
-    msg_handle: oneshot::Sender<Downloading>,
+    voice_msg_duration_secs: u32,
 }
 
-// All of these values represent the two sides of the state machine. The *Fut values are the
-// transcriber side that send their updated state through the non-*Fut sides back to the message
-struct StartFut(oneshot::Sender<Downloading>);
-
-impl StartFut {
-    fn downloading(self) -> DownloadingFut {
+impl JobFut {
+    fn start_download(self) -> Option<DownloadStartedFut> {
+        let Self { next, meta } = self;
         let (tx, rx) = oneshot::channel();
-        self.0.send(Ok(rx)).unwrap();
-        DownloadingFut(tx)
+        next.send(rx).ok()?;
+        Some(DownloadStartedFut { next: tx, meta })
     }
 }
 
-type Downloading = Result<oneshot::Receiver<Transcribing>, ()>;
+type DownloadStarted = oneshot::Receiver<Result<Downloading>>;
 
-struct DownloadingFut(oneshot::Sender<Transcribing>);
+#[must_use]
+struct DownloadStartedFut {
+    next: oneshot::Sender<Result<Downloading>>,
+    meta: JobMeta,
+}
+
+impl DownloadStartedFut {
+    async fn finish_download(self, voice_msg_path: String) -> Option<DownloadingFut> {
+        let Self {
+            next,
+            meta: JobMeta {
+                bot, voice_file_id, ..
+            },
+        } = self;
+        let (tx, rx) = oneshot::channel();
+
+        if let Err(e) = bot
+            .download_file(Path::new(&voice_msg_path), voice_file_id)
+            .await
+        {
+            next.send(Err(e.into())).ok()?;
+            None
+        } else {
+            next.send(Ok(rx)).ok()?;
+            Some(DownloadingFut(tx))
+        }
+    }
+}
+
+type Downloading = oneshot::Receiver<Result<Transcribing>>;
+
+#[must_use]
+struct DownloadingFut(oneshot::Sender<Result<Transcribing>>);
 
 impl DownloadingFut {
-    fn transcribing(self) -> TranscribingFut {
-        let (tx, rx) = oneshot::channel();
+    fn start_transcription(self) -> Option<TranscribingFut> {
+        let (msg_handle, transcriber_handle) = mpsc::channel(16);
+        let shared_transcription = Arc::default();
         self.0
-            .send(Transcribing::InProgress {
-                next: rx,
-                transcription: String::new(),
-            })
-            .unwrap();
-        TranscribingFut(tx)
+            .send(Ok(Transcribing {
+                finished: false,
+                transcriber_handle,
+                shared_transcription: Arc::clone(&shared_transcription),
+            }))
+            .ok()?;
+        Some(TranscribingFut {
+            msg_handle,
+            shared_transcription,
+        })
     }
 }
 
-#[derive(Debug)]
-pub enum Transcribing {
-    InProgress {
-        next: oneshot::Receiver<Transcribing>,
-        transcription: String,
-    },
-    Finished(String),
-    Error,
+#[must_use]
+pub struct Transcribing {
+    // TODO: switch this over to a tokio::sync::watch channel
+    finished: bool,
+    transcriber_handle: mpsc::Receiver<Result<Update>>,
+    shared_transcription: Arc<Mutex<String>>,
 }
 
-struct TranscribingFut(oneshot::Sender<Transcribing>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Update {
+    InProgress,
+    Finished,
+}
 
-impl TranscribingFut {
-    fn in_progress(self, transcription: String) -> Self {
-        let (tx, rx) = oneshot::channel();
-        self.0
-            .send(Transcribing::InProgress {
-                next: rx,
-                transcription,
-            })
-            .unwrap();
-        Self(tx)
-    }
+impl Transcribing {
+    pub async fn next(&mut self) -> Result<Option<String>> {
+        if self.finished {
+            return Ok(None);
+        }
 
-    fn job_finished(self, transcription: String) {
-        self.0.send(Transcribing::Finished(transcription)).unwrap();
+        let mut maybe_update = self
+            .transcriber_handle
+            .recv()
+            .await
+            .ok_or(Error::WorkerDied)?;
+        // Skip any queued in-progress updates
+        while maybe_update
+            .as_ref()
+            .map_or(false, |&update| update == Update::InProgress)
+        {
+            match self.transcriber_handle.try_recv() {
+                Ok(next) => maybe_update = next,
+                Err(_) => break,
+            }
+        }
+
+        match maybe_update {
+            Ok(Update::InProgress) => {
+                let transcription = self.shared_transcription.lock().await.to_owned();
+                Ok(Some(transcription))
+            }
+            Ok(Update::Finished) => {
+                self.finished = true;
+                let transcription = self.shared_transcription.lock().await.to_owned();
+                Ok(Some(transcription))
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct Pool(async_channel::Sender<Job>);
+struct TranscribingFut {
+    msg_handle: mpsc::Sender<Result<Update>>,
+    shared_transcription: Arc<Mutex<String>>,
+}
+
+impl TranscribingFut {
+    async fn finish_transcription(self, voice_msg_path: String, duration: u32) -> Option<()> {
+        // Do slower transcriptions on longer messages just while this is running on weaker
+        // hardware
+        // TODO: remove after we get setup on a GPU
+        let num_threads = if duration > 10 * 60 { "2" } else { "4" };
+
+        let fut = self.clone();
+        let res = match tokio::task::spawn_blocking(move || {
+            run_sync_process(voice_msg_path, num_threads, fut)
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(Update::Finished),
+            Ok(Err(err)) => Err(err),
+            Err(err) => {
+                log::warn!("Sync process wrapper died unexpectedly: {err}");
+                Err(Error::WorkerDied)
+            }
+        };
+
+        self.msg_handle.send(res).await.ok()
+    }
+}
+
+#[derive(Clone)]
+pub struct Pool(async_channel::Sender<JobFut>);
 
 impl Pool {
     pub async fn spawn(num_workers: u8) -> Self {
@@ -78,7 +180,7 @@ impl Pool {
         let mut transcribers = JoinSet::new();
         let (tx_workers, rx_workers) = async_channel::bounded(32);
         for i in 0..num_workers {
-            transcribers.spawn(run_transcriber(rx_workers.clone(), i));
+            transcribers.spawn(run_worker(rx_workers.clone(), i));
         }
 
         // NOTE: Keep all the transcribers running in the background
@@ -92,122 +194,89 @@ impl Pool {
         &self,
         bot: Bot,
         voice_file_id: String,
-    ) -> oneshot::Receiver<Downloading> {
+        voice_msg_duration_secs: u32,
+    ) -> oneshot::Receiver<DownloadStarted> {
         let (msg_handle, job_handle) = oneshot::channel();
         log::info!("Starting transcribe task for {voice_file_id}");
-        self.0
-            .send(Job {
-                bot,
-                voice_file_id,
-                msg_handle,
+        let _ = self
+            .0
+            .send(JobFut {
+                next: msg_handle,
+                meta: JobMeta {
+                    bot,
+                    voice_file_id,
+                    voice_msg_duration_secs,
+                },
             })
-            .await
-            .unwrap();
+            .await;
 
         job_handle
     }
 }
 
-async fn run_transcriber(rx: async_channel::Receiver<Job>, id: u8) {
-    while let Ok(Job {
-        bot,
-        voice_file_id,
-        // TODO: rename this to like state_machine
-        msg_handle,
-    }) = rx.recv().await
-    {
+// TODO: keep the model around and use a timeout
+async fn run_worker(rx: async_channel::Receiver<JobFut>, id: u8) {
+    while let Ok(job) = rx.recv().await {
         let voice_msg_path = format!("/tmp/voice_msg_{id}.ogg");
-        log::info!("Worker {id} got work {voice_file_id}");
-        let start_fut = StartFut(msg_handle);
-        let downloading_fut = start_fut.downloading();
-
-        bot.download_file(Path::new(&voice_msg_path), voice_file_id)
+        log::info!("Worker {} got work {}", id, job.meta.voice_file_id);
+        if run_transcription_process(job, voice_msg_path)
             .await
-            .unwrap();
-        let duration_bytes = std::process::Command::new("ffprobe")
-            .args([
-                "-i",
-                &voice_msg_path,
-                "-show_entries",
-                "format=duration",
-                "-v",
-                "quiet",
-                "-of",
-                "csv=p=0",
-            ])
-            .output()
-            .unwrap()
-            .stdout;
-        let duration = String::from_utf8(duration_bytes)
-            .unwrap()
-            .trim()
-            .parse::<f32>()
-            .unwrap() as u32;
-        let transcribing_fut = downloading_fut.transcribing();
-
-        // Do slower transcriptions on longer messages just while this is running on weaker
-        // hardware
-        // TODO: remove after we get setup on a GPU
-        let num_threads = if duration > 10 * 60 { "2" } else { "4" };
-
-        if let Err(_) = tokio::task::spawn_blocking(move || {
-            run_sync_process_wrapper(&voice_msg_path, &num_threads, transcribing_fut)
-        })
-        .await
+            .is_none()
         {
-            // let _ = msg_handle.send(Update::ErroredOut).await;
-            todo!("Send error back to message");
+            log::warn!("Transcription job died. Oh well");
         }
     }
 }
 
-fn run_sync_process_wrapper(
-    voice_msg_path: &str,
-    num_threads: &str,
-    transcribing_fut: TranscribingFut,
-) {
-    fn inner(
-        voice_msg_path: &str,
-        num_threads: &str,
-        mut transcribing_fut: TranscribingFut,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // let handle = Handle::current();
+async fn run_transcription_process(job: JobFut, voice_msg_path: String) -> Option<()> {
+    let duration = job.meta.voice_msg_duration_secs;
+    job.start_download()?
+        .finish_download(voice_msg_path.clone())
+        .await?
+        .start_transcription()?
+        .finish_transcription(voice_msg_path, duration)
+        .await
+}
 
-        // `whisper` is too smart and pipes its output when it detects a non-interactive stdout, so
-        // we have to fake being a tty to get it to stream for us. This also seems to fuck up the
-        // logs formatting unfortunately.
-        let mut whisper_stdout = fake_tty::bash_command(&format!(
-            "whisper {voice_msg_path} --model medium.en --thread {num_threads} --fp16 False"
-        ))?
-        .stderr(Stdio::null())
-        .spawn()?
-        .stdout
-        .expect("We need stdout");
-        let mut read_buf = vec![0; 512];
-        let mut transcription = String::new();
-        loop {
-            let bytes_read = whisper_stdout.read(&mut read_buf)?;
-            transcription.push_str(std::str::from_utf8(&read_buf[..bytes_read])?);
+fn run_sync_process(
+    voice_msg_path: String,
+    num_threads: &'static str,
+    fut: TranscribingFut,
+) -> Result<()> {
+    let handle = Handle::current();
+    let TranscribingFut {
+        shared_transcription,
+        msg_handle,
+    } = fut;
 
-            transcribing_fut = transcribing_fut.in_progress(transcription.to_owned());
-            // handle.block_on(
-            //     msg_handle.send(Update::CurrentTranscription(transcription.to_owned())),
-            // )?;
-
-            if bytes_read == 0 {
-                break;
+    // `whisper` is too smart and pipes its output when it detects a non-interactive stdout, so
+    // we have to fake being a tty to get it to stream for us. This also seems to fuck up the
+    // logs formatting unfortunately.
+    let mut whisper_stdout = fake_tty::bash_command(&format!(
+        "whisper {voice_msg_path} --model medium.en --thread {num_threads} --fp16 False"
+    ))?
+    .stderr(Stdio::null())
+    .spawn()?
+    .stdout
+    .expect("We need stdout");
+    let mut read_buf = vec![0; 4_096];
+    loop {
+        let bytes_read = whisper_stdout.read(&mut read_buf)?;
+        let utf8_snippet = std::str::from_utf8(&read_buf[..bytes_read])?;
+        handle.block_on(async {
+            {
+                shared_transcription.lock().await.push_str(utf8_snippet);
             }
+            msg_handle
+                .send(Ok(Update::InProgress))
+                .await
+                .map_err(|_| Error::MessageHandleDied)
+        })?;
+
+        if bytes_read == 0 {
+            break;
         }
-
-        // handle.block_on(msg_handle.send(Update::Finished(transcription)))?;
-        transcribing_fut.job_finished(transcription);
-
-        Ok(())
     }
 
-    if let Err(_) = inner(voice_msg_path, num_threads, transcribing_fut) {
-        // let handle = Handle::current();
-        // let _ = handle.block_on(msg_handle.send(Update::ErroredOut));
-        todo!("Report error back");
-    }
+    Ok(())
 }
