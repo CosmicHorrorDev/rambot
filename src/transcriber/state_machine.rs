@@ -1,3 +1,9 @@
+//! Home to a state machine and its interruptible handle representing the transcription process
+//!
+//! All the *Fut and non-*Fut values here represent the two sides of the transcription process'
+//! state machine where the *Fut side automatically emits updates to the non-*Fut side that expand
+//! out to follow the state machine's flow
+
 use std::{io::Read, path::Path, process::Stdio, sync::Arc};
 
 use crate::{telegram::Bot, Error, Result};
@@ -5,28 +11,24 @@ use crate::{telegram::Bot, Error, Result};
 use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot, Mutex},
-    task::JoinSet,
 };
 
-// TODO: move all of this under a `state_machine` module
+// TODO: provide some kind of constructor
 // TODO: wrap non-fut so that we can expose a meaningful error directly?
-// All the *Fut and non-*Fut values here represent the two sides of the transcription process'
-// state machine where the *Fut side automatically emits updates to the non-*Fut side that expand
-// out to follow the state machine's flow
 #[must_use]
-struct JobFut {
-    next: oneshot::Sender<DownloadStarted>,
-    meta: JobMeta,
+pub struct JobFut {
+    pub next: oneshot::Sender<DownloadStarted>,
+    pub meta: JobMeta,
 }
 
-struct JobMeta {
-    bot: Bot,
-    voice_file_id: String,
-    voice_msg_duration_secs: u32,
+pub struct JobMeta {
+    pub bot: Bot,
+    pub voice_file_id: String,
+    pub voice_msg_duration_secs: u32,
 }
 
 impl JobFut {
-    fn start_download(self) -> Option<DownloadStartedFut> {
+    pub fn start_download(self) -> Option<DownloadStartedFut> {
         let Self { next, meta } = self;
         let (tx, rx) = oneshot::channel();
         next.send(rx).ok()?;
@@ -34,16 +36,16 @@ impl JobFut {
     }
 }
 
-type DownloadStarted = oneshot::Receiver<Result<Downloading>>;
+pub type DownloadStarted = oneshot::Receiver<Result<Downloading>>;
 
 #[must_use]
-struct DownloadStartedFut {
+pub struct DownloadStartedFut {
     next: oneshot::Sender<Result<Downloading>>,
     meta: JobMeta,
 }
 
 impl DownloadStartedFut {
-    async fn finish_download(self, voice_msg_path: String) -> Option<DownloadingFut> {
+    pub async fn finish_download(self, voice_msg_path: String) -> Option<DownloadingFut> {
         let Self {
             next,
             meta: JobMeta {
@@ -65,13 +67,14 @@ impl DownloadStartedFut {
     }
 }
 
-type Downloading = oneshot::Receiver<Result<Transcribing>>;
+// TODO: rename all `Downloading` -> `Downloaded`
+pub type Downloading = oneshot::Receiver<Result<Transcribing>>;
 
 #[must_use]
-struct DownloadingFut(oneshot::Sender<Result<Transcribing>>);
+pub struct DownloadingFut(oneshot::Sender<Result<Transcribing>>);
 
 impl DownloadingFut {
-    fn start_transcription(self) -> Option<TranscribingFut> {
+    pub fn start_transcription(self) -> Option<TranscribingFut> {
         let (msg_handle, transcriber_handle) = mpsc::channel(16);
         let shared_transcription = Arc::default();
         self.0
@@ -140,13 +143,13 @@ impl Transcribing {
 }
 
 #[derive(Clone)]
-struct TranscribingFut {
+pub struct TranscribingFut {
     msg_handle: mpsc::Sender<Result<Update>>,
     shared_transcription: Arc<Mutex<String>>,
 }
 
 impl TranscribingFut {
-    async fn finish_transcription(self, voice_msg_path: String, duration: u32) -> Option<()> {
+    pub async fn finish_transcription(self, voice_msg_path: String, duration: u32) -> Option<()> {
         // Do slower transcriptions on longer messages just while this is running on weaker
         // hardware
         // TODO: remove after we get setup on a GPU
@@ -159,7 +162,10 @@ impl TranscribingFut {
         .await
         {
             Ok(Ok(())) => Ok(Update::Finished),
-            Ok(Err(err)) => Err(err),
+            Ok(Err(err)) => {
+                log::warn!("Sync process wrapper returned an error: {err}");
+                Err(err)
+            }
             Err(err) => {
                 log::warn!("Sync process wrapper died unexpectedly: {err}");
                 Err(Error::WorkerDied)
@@ -168,74 +174,6 @@ impl TranscribingFut {
 
         self.msg_handle.send(res).await.ok()
     }
-}
-
-#[derive(Clone)]
-pub struct Pool(async_channel::Sender<JobFut>);
-
-impl Pool {
-    pub async fn spawn(num_workers: u8) -> Self {
-        // TODO: switch this to NonZeroU8?
-        assert!(num_workers != 0);
-        let mut transcribers = JoinSet::new();
-        let (tx_workers, rx_workers) = async_channel::bounded(32);
-        for i in 0..num_workers {
-            transcribers.spawn(run_worker(rx_workers.clone(), i));
-        }
-
-        // NOTE: Keep all the transcribers running in the background
-        transcribers.detach_all();
-
-        Self(tx_workers)
-    }
-
-    #[must_use]
-    pub async fn submit_job(
-        &self,
-        bot: Bot,
-        voice_file_id: String,
-        voice_msg_duration_secs: u32,
-    ) -> oneshot::Receiver<DownloadStarted> {
-        let (msg_handle, job_handle) = oneshot::channel();
-        log::info!("Starting transcribe task for {voice_file_id}");
-        let _ = self
-            .0
-            .send(JobFut {
-                next: msg_handle,
-                meta: JobMeta {
-                    bot,
-                    voice_file_id,
-                    voice_msg_duration_secs,
-                },
-            })
-            .await;
-
-        job_handle
-    }
-}
-
-// TODO: keep the model around and use a timeout
-async fn run_worker(rx: async_channel::Receiver<JobFut>, id: u8) {
-    while let Ok(job) = rx.recv().await {
-        let voice_msg_path = format!("/tmp/voice_msg_{id}.ogg");
-        log::info!("Worker {} got work {}", id, job.meta.voice_file_id);
-        if run_transcription_process(job, voice_msg_path)
-            .await
-            .is_none()
-        {
-            log::warn!("Transcription job died. Oh well");
-        }
-    }
-}
-
-async fn run_transcription_process(job: JobFut, voice_msg_path: String) -> Option<()> {
-    let duration = job.meta.voice_msg_duration_secs;
-    job.start_download()?
-        .finish_download(voice_msg_path.clone())
-        .await?
-        .start_transcription()?
-        .finish_transcription(voice_msg_path, duration)
-        .await
 }
 
 fn run_sync_process(

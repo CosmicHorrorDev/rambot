@@ -26,12 +26,13 @@ impl Bot {
         Ok(())
     }
 
-    pub async fn send_message(
+    pub async fn send_message<S: Into<String>>(
         &self,
         chat_id: types::ChatId,
         reply_to: types::MessageId,
-        text: &str,
+        text: S,
     ) -> Result<Message> {
+        let text = text.into();
         log::debug!("Sending reply to message {reply_to} text:\n{text}");
         let msg = <teloxide::Bot as Requester>::SendMessage::new(
             self.0.clone(),
@@ -56,6 +57,20 @@ impl Bot {
         self.0.download_file(&file_meta.path, &mut file).await?;
         Ok(())
     }
+
+    pub async fn forward_message(
+        &self,
+        to_chat_id: types::ChatId,
+        from_chat_id: types::ChatId,
+        msg_id: types::MessageId,
+    ) -> Result<Message> {
+        log::debug!("Forwarding message {msg_id} from {from_chat_id} to {to_chat_id}");
+        let msg = self
+            .0
+            .forward_message(to_chat_id, from_chat_id, msg_id)
+            .await?;
+        Ok(Message::new(self.clone(), &msg))
+    }
 }
 
 #[derive(Clone)]
@@ -74,7 +89,12 @@ impl Message {
         }
     }
 
-    pub async fn edit_text(&self, text: &str) -> Result<()> {
+    pub fn id(&self) -> types::MessageId {
+        self.msg_id
+    }
+
+    pub async fn edit_text<S: Into<String>>(&self, text: S) -> Result<()> {
+        let text = text.into();
         log::debug!(
             "Editing message {} len {} snippet:\n{}",
             self.msg_id,

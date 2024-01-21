@@ -1,25 +1,34 @@
-// TODO: have a structured parsed line, so that we can do things based on timestamps and stuff
-
-// FIXME: temporarily limiting the number of lines to avoid wall-of-texting things. Setup a sidecar
-// chat (after getting config stuff setup)
-pub fn srt_like_to_telegram_ts(lines: &str) -> String {
-    let converted: Vec<_> = lines
-        .lines()
-        .take(10)
-        .filter_map(srt_like_to_telegram_ts_line)
-        .collect::<Vec<_>>();
-
-    let truncated = converted.len() == 10;
-    let mut output = converted.join("\n");
-    if truncated {
-        output.push_str("\n[truncated]");
-    }
-    output
+#[derive(Clone, Debug)]
+pub struct Line {
+    pub start_secs: u32,
+    pub end_secs: u32,
+    pub text: String,
 }
 
-// TODO: need to change this to timestamp right for >1 hr long transcriptions
-pub fn srt_like_to_telegram_ts_line(line: &str) -> Option<String> {
-    let mm_ss = line.get(1..6)?;
-    let text = line.get(27..)?;
-    Some(format!("{mm_ss} {text}"))
+impl Line {
+    pub fn new(line: &str) -> Option<Self> {
+        let start_min = line.get(1..3)?;
+        let start_sec = line.get(4..6)?;
+        let end_min = line.get(15..17)?;
+        let end_sec = line.get(18..20)?;
+        let text = line.get(27..)?.to_owned();
+
+        let start_secs = start_min.parse::<u32>().ok()? * 60 + start_sec.parse::<u32>().ok()?;
+        let end_secs = end_min.parse::<u32>().ok()? * 60 + end_sec.parse::<u32>().ok()?;
+
+        Some(Self {
+            start_secs,
+            end_secs,
+            text,
+        })
+    }
+
+    pub fn into_telegram_line(self) -> String {
+        format!(
+            "{:02}:{:02} {}",
+            self.start_secs / 60,
+            self.start_secs % 60,
+            self.text
+        )
+    }
 }
