@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::{telegram, Error, Result};
+use crate::{telegram, HandlerError, HandlerResult};
 
 use teloxide::types;
 use tokio::{sync::mpsc, time};
@@ -23,7 +23,7 @@ impl SendMsgHandle {
         chat_id: types::ChatId,
         reply_to: types::MessageId,
         text: S,
-    ) -> Result<UpdateMsgHandle> {
+    ) -> HandlerResult<UpdateMsgHandle> {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
         self.req_tx
@@ -34,7 +34,7 @@ impl SendMsgHandle {
                 req_rx,
                 resp_tx,
             })
-            .map_err(|_| Error::SendMsgWorkerDied)?;
+            .map_err(|_| HandlerError::SendMsgWorkerDied)?;
         Ok(UpdateMsgHandle { req_tx, resp_rx })
     }
 }
@@ -47,11 +47,11 @@ pub struct UpdateMsgHandle {
 }
 
 impl UpdateMsgHandle {
-    pub fn dispatch_edit_text<S: Into<String>>(&mut self, text: S) -> Result<()> {
+    pub fn dispatch_edit_text<S: Into<String>>(&mut self, text: S) -> HandlerResult<()> {
         let text = text.into();
         self.req_tx
             .send(UpdateReq::Edit(text))
-            .map_err(|_| Error::UpdateMsgWorkerDied)?;
+            .map_err(|_| HandlerError::UpdateMsgWorkerDied)?;
         while let Ok(resp) = self.resp_rx.try_recv() {
             match resp {
                 MsgResp::Flush => unreachable!("Should never be seen outside a `.flush()` call"),
@@ -65,18 +65,18 @@ impl UpdateMsgHandle {
     // NOTE: calling `.flush()` is the only source of `Flush`es getting sent through. You MUST
     // ensure that we always consume the `Flush` that we sent through even when we're getting
     // errors in the process
-    pub async fn flush(&mut self) -> Result<()> {
+    pub async fn flush(&mut self) -> HandlerResult<()> {
         // Pass a flush through and make sure we get it back on the other side
         self.req_tx
             .send(UpdateReq::Flush)
-            .map_err(|_| Error::UpdateMsgWorkerDied)?;
+            .map_err(|_| HandlerError::UpdateMsgWorkerDied)?;
 
         let mut delayed_error = None;
         loop {
             match self.resp_rx.recv().await {
                 // An error returned from the worker is more interesting than (and could be the
                 // cause of) the worker dying. Return that when available
-                None => break Err(delayed_error.unwrap_or(Error::UpdateMsgWorkerDied)),
+                None => break Err(delayed_error.unwrap_or(HandlerError::UpdateMsgWorkerDied)),
                 Some(MsgResp::Error(e)) => {
                     log::info!("Captured delayed error: {e}");
                     delayed_error = Some(e)
@@ -86,7 +86,7 @@ impl UpdateMsgHandle {
         }
     }
 
-    pub async fn close(mut self) -> Result<()> {
+    pub async fn close(mut self) -> HandlerResult<()> {
         self.flush().await?;
         Ok(())
     }
@@ -107,7 +107,7 @@ enum UpdateReq {
 
 enum MsgResp {
     Flush,
-    Error(Error),
+    Error(HandlerError),
 }
 
 async fn run_send_worker(mut rx: mpsc::UnboundedReceiver<SendReq>, bot: telegram::Bot) {
@@ -153,6 +153,7 @@ async fn run_update_worker(
                         _ = time::sleep_until(slight_delay) => break,
                         maybe_req = rx.recv() => {
                             let Some(req) = maybe_req else {
+                                // Msg handler hung up
                                 break;
                             };
                             match req {

@@ -6,7 +6,7 @@
 
 use std::{io::Read, path::Path, process::Stdio, sync::Arc};
 
-use crate::{telegram::Bot, Error, Result};
+use crate::{telegram::Bot, HandlerError, HandlerResult};
 
 use tokio::{
     runtime::Handle,
@@ -36,11 +36,11 @@ impl JobFut {
     }
 }
 
-pub type DownloadStarted = oneshot::Receiver<Result<Downloading>>;
+pub type DownloadStarted = oneshot::Receiver<HandlerResult<Downloading>>;
 
 #[must_use]
 pub struct DownloadStartedFut {
-    next: oneshot::Sender<Result<Downloading>>,
+    next: oneshot::Sender<HandlerResult<Downloading>>,
     meta: JobMeta,
 }
 
@@ -68,10 +68,10 @@ impl DownloadStartedFut {
 }
 
 // TODO: rename all `Downloading` -> `Downloaded`
-pub type Downloading = oneshot::Receiver<Result<Transcribing>>;
+pub type Downloading = oneshot::Receiver<HandlerResult<Transcribing>>;
 
 #[must_use]
-pub struct DownloadingFut(oneshot::Sender<Result<Transcribing>>);
+pub struct DownloadingFut(oneshot::Sender<HandlerResult<Transcribing>>);
 
 impl DownloadingFut {
     pub fn start_transcription(self) -> Option<TranscribingFut> {
@@ -95,7 +95,7 @@ impl DownloadingFut {
 pub struct Transcribing {
     // TODO: switch this over to a tokio::sync::watch channel
     finished: bool,
-    transcriber_handle: mpsc::Receiver<Result<Update>>,
+    transcriber_handle: mpsc::Receiver<HandlerResult<Update>>,
     shared_transcription: Arc<Mutex<String>>,
 }
 
@@ -106,7 +106,7 @@ pub enum Update {
 }
 
 impl Transcribing {
-    pub async fn next(&mut self) -> Result<Option<String>> {
+    pub async fn next(&mut self) -> HandlerResult<Option<String>> {
         if self.finished {
             return Ok(None);
         }
@@ -115,7 +115,7 @@ impl Transcribing {
             .transcriber_handle
             .recv()
             .await
-            .ok_or(Error::WorkerDied)?;
+            .ok_or(HandlerError::WorkerDied)?;
         // Skip any queued in-progress updates
         while maybe_update
             .as_ref()
@@ -144,7 +144,7 @@ impl Transcribing {
 
 #[derive(Clone)]
 pub struct TranscribingFut {
-    msg_handle: mpsc::Sender<Result<Update>>,
+    msg_handle: mpsc::Sender<HandlerResult<Update>>,
     shared_transcription: Arc<Mutex<String>>,
 }
 
@@ -168,7 +168,7 @@ impl TranscribingFut {
             }
             Err(err) => {
                 log::warn!("Sync process wrapper died unexpectedly: {err}");
-                Err(Error::WorkerDied)
+                Err(HandlerError::WorkerDied)
             }
         };
 
@@ -180,7 +180,7 @@ fn run_sync_process(
     voice_msg_path: String,
     num_threads: &'static str,
     fut: TranscribingFut,
-) -> Result<()> {
+) -> HandlerResult {
     let handle = Handle::current();
     let TranscribingFut {
         shared_transcription,
@@ -191,7 +191,7 @@ fn run_sync_process(
     // we have to fake being a tty to get it to stream for us. This also seems to fuck up the
     // logs formatting unfortunately.
     let mut whisper_stdout = fake_tty::bash_command(&format!(
-        "whisper {voice_msg_path} --model medium.en --thread {num_threads} --fp16 False"
+        "whisper {voice_msg_path} --model small.en --thread {num_threads} --fp16 False"
     ))?
     .stderr(Stdio::null())
     .spawn()?
@@ -208,7 +208,7 @@ fn run_sync_process(
             msg_handle
                 .send(Ok(Update::InProgress))
                 .await
-                .map_err(|_| Error::MessageHandleDied)
+                .map_err(|_| HandlerError::MessageHandleDied)
         })?;
 
         if bytes_read == 0 {

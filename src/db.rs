@@ -8,7 +8,10 @@ use std::{
     result::Result as StdResult, str::FromStr, sync::Arc,
 };
 
-use crate::{error::DbError, Error, Result};
+use crate::{
+    error::{DbError, DbResult, UserError},
+    HandlerResult,
+};
 
 use serde::{Deserialize, Serialize};
 use teloxide::types;
@@ -21,7 +24,7 @@ pub struct Db {
 }
 
 impl Db {
-    pub async fn load() -> Result<Self> {
+    pub async fn load() -> DbResult<Self> {
         let path = Self::db_path()?;
         let inner: Inner = match fs::read_to_string(&path).await {
             Ok(contents) => ron::from_str(&contents).map_err(DbError::FailedDeserialize),
@@ -39,9 +42,9 @@ impl Db {
     }
 
     // TODO: `.write()` really shouldn't be called outside of this. Restrict the API more?
-    async fn dump_after<F>(&self, f: F) -> Result
+    async fn dump_after<F>(&self, f: F) -> HandlerResult
     where
-        F: FnOnce(&mut Inner) -> Result,
+        F: FnOnce(&mut Inner) -> HandlerResult,
     {
         let mut write_handle = self.inner.write().await;
         let prev = write_handle.clone();
@@ -70,14 +73,14 @@ impl Db {
         delayed_res
     }
 
-    fn db_path() -> Result<PathBuf> {
+    fn db_path() -> DbResult<PathBuf> {
         match dirs::data_dir() {
             Some(dir) => Ok(dir.join("rambot").join("db.ron")),
-            None => Err(Error::UnknownDataDir),
+            None => Err(DbError::NoDataDir),
         }
     }
 
-    pub async fn update_metadata(&self, msg: &types::Message) -> Result {
+    pub async fn update_metadata(&self, msg: &types::Message) -> HandlerResult {
         self.dump_after(|inner| {
             let chat = inner
                 .chats
@@ -117,10 +120,10 @@ impl Db {
     pub async fn get_sidecar_attach(
         &self,
         chat_id: types::ChatId,
-    ) -> Result<Option<SidecarAttach>> {
+    ) -> HandlerResult<Option<SidecarAttach>> {
         match self.inner.read().await.chats.get(&chat_id) {
             Some(chat) => Ok(chat.sidecar_attach.clone()),
-            None => Err(Error::MissingChat(chat_id)),
+            None => Err(UserError::MissingChat(chat_id).into()),
         }
     }
 
@@ -128,21 +131,21 @@ impl Db {
         &self,
         chat_id: types::ChatId,
         sidecar_id: types::ChatId,
-    ) -> Result {
+    ) -> HandlerResult {
         self.dump_after(|inner| {
             if let Some(Chat {
                 sidecar_attach: Some(attach),
                 ..
             }) = inner.chats.get(&chat_id)
             {
-                return Err(Error::ChatAlreadyHasAttach(attach.self_kind));
+                return Err(UserError::ChatAlreadyHasAttach(attach.self_kind).into());
             };
             if let Some(Chat {
                 sidecar_attach: Some(attach),
                 ..
             }) = inner.chats.get(&sidecar_id)
             {
-                return Err(Error::SidecarAlreadyHasAttach(attach.self_kind));
+                return Err(UserError::SidecarAlreadyHasAttach(attach.self_kind).into());
             };
 
             let chat = inner.chats.get_mut(&chat_id).unwrap();
@@ -155,16 +158,16 @@ impl Db {
         .await
     }
 
-    pub async fn detach_sidecar(&self, chat_id: types::ChatId) -> Result {
+    pub async fn detach_sidecar(&self, chat_id: types::ChatId) -> HandlerResult {
         self.dump_after(|inner| {
             let chat = inner
                 .chats
                 .get_mut(&chat_id)
-                .ok_or_else(|| Error::MissingChat(chat_id))?;
+                .ok_or_else(|| UserError::MissingChat(chat_id))?;
             let sidecar_attach = chat
                 .sidecar_attach
                 .take()
-                .ok_or(Error::MissingSidecarAttach)?;
+                .ok_or(UserError::MissingSidecarAttach)?;
 
             // Sidecar should always have a valid attachment
             let sidecar = inner
@@ -179,10 +182,13 @@ impl Db {
         .await
     }
 
-    async fn get_transcribe_trigger(&self, user_id: types::UserId) -> Result<TranscribeTrigger> {
+    async fn get_transcribe_trigger(
+        &self,
+        user_id: types::UserId,
+    ) -> HandlerResult<TranscribeTrigger> {
         match self.inner.read().await.users.get(&user_id) {
             Some(user) => Ok(user.trigger),
-            None => Err(Error::MissingUser(user_id)),
+            None => Err(UserError::MissingUser(user_id).into()),
         }
     }
 
@@ -190,25 +196,25 @@ impl Db {
         &self,
         user_id: types::UserId,
         trigger: TranscribeTrigger,
-    ) -> Result {
+    ) -> HandlerResult {
         self.dump_after(|inner| match inner.users.get_mut(&user_id) {
             Some(user) => {
                 user.trigger = trigger;
                 Ok(())
             }
-            None => Err(Error::MissingUser(user_id)),
+            None => Err(UserError::MissingUser(user_id).into()),
         })
         .await
     }
 
-    pub async fn is_trusted_user(&self, user_id: types::UserId) -> Result<bool> {
+    pub async fn is_trusted_user(&self, user_id: types::UserId) -> HandlerResult<bool> {
         match self.inner.read().await.users.get(&user_id) {
             Some(user) => Ok(user.trusted_user.is_some()),
-            None => Err(Error::MissingUser(user_id)),
+            None => Err(UserError::MissingUser(user_id).into()),
         }
     }
 
-    pub async fn add_trusted_user(&self, user_id: types::UserId, name: String) -> Result {
+    pub async fn add_trusted_user(&self, user_id: types::UserId, name: String) -> HandlerResult {
         self.dump_after(|inner| {
             let user = inner.users.entry(user_id).or_default();
             user.trusted_user = Some(name);
@@ -243,6 +249,10 @@ pub struct DbUser {
 }
 
 impl DbUser {
+    pub fn id(&self) -> types::UserId {
+        self.user_id
+    }
+
     pub async fn is_trusted(&self) -> bool {
         self.db.is_trusted_user(self.user_id).await.unwrap()
     }
@@ -251,8 +261,14 @@ impl DbUser {
         self.db.get_transcribe_trigger(self.user_id).await.unwrap()
     }
 
-    pub async fn set_transcribe_trigger(&self, trigger: TranscribeTrigger) -> Result {
+    pub async fn set_transcribe_trigger(&self, trigger: TranscribeTrigger) -> HandlerResult {
         self.db.set_transcribe_trigger(self.user_id, trigger).await
+    }
+}
+
+impl PartialEq for DbUser {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
     }
 }
 
@@ -312,6 +328,12 @@ impl FromStr for TranscribeTrigger {
         assert_eq!(s, trigger.as_str());
 
         Ok(trigger)
+    }
+}
+
+impl fmt::Display for TranscribeTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

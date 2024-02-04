@@ -1,14 +1,26 @@
-use std::{env, io};
+use std::{env, io, result::Result as StdResult};
 
 use crate::db;
 
 use teloxide::types;
 use thiserror::Error as ThisError;
 
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type InitResult<T = ()> = StdResult<T, InitError>;
+pub type HandlerResult<T = ()> = StdResult<T, HandlerError>;
+pub type DbResult<T = ()> = StdResult<T, DbError>;
 
 #[derive(Debug, ThisError)]
-pub enum Error {
+pub enum InitError {
+    #[error("{0}")]
+    BotCommands(teloxide::RequestError),
+    #[error("Failed loading the database: {0}")]
+    DbLoad(#[from] DbError),
+    #[error("`$BOT_NAME` should be set to the bot's name. Error: {0}")]
+    InvalidBotName(env::VarError),
+}
+
+#[derive(Debug, ThisError)]
+pub enum HandlerError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("Telegram API download error: {0}")]
@@ -29,6 +41,29 @@ pub enum Error {
     UnknownDataDir,
     #[error("Database error: {0}")]
     DbError(#[from] DbError),
+    #[error("{0}")]
+    UserError(#[from] UserError),
+    #[error("A silent way for a handler to bail")]
+    Ignore,
+}
+
+impl HandlerError {
+    pub fn worker_died<E: std::error::Error>(_: E) -> Self {
+        Self::WorkerDied
+    }
+}
+
+impl From<teloxide::utils::command::ParseError> for HandlerError {
+    fn from(parse_error: teloxide::utils::command::ParseError) -> Self {
+        Self::UserError(parse_error.into())
+    }
+}
+
+// TODO: rename to `UserFacing`
+#[derive(Debug, ThisError)]
+pub enum UserError {
+    #[error("{0}")]
+    CommandParseError(#[from] teloxide::utils::command::ParseError),
     #[error("Missing entry for user {0}")]
     MissingUser(types::UserId),
     #[error("No sidecar attachment found")]
@@ -39,20 +74,24 @@ pub enum Error {
     ChatAlreadyHasAttach(db::SidecarKind),
     #[error("Sidecar chat already has a sidecar attachment: {0:?}")]
     SidecarAlreadyHasAttach(db::SidecarKind),
-    #[error("`$BOT_NAME` should be set to the bot's name. Error: {0}")]
-    InvalidBotName(env::VarError),
-    #[error("{0}")]
-    CommandParseError(#[from] teloxide::utils::command::ParseError),
-}
-
-impl Error {
-    pub(crate) fn worker_died<E: std::error::Error>(_: E) -> Self {
-        Self::WorkerDied
-    }
+    #[error("Your message should be a reply to another message")]
+    NotReply,
+    #[error("Your message should be a reply to a voice message")]
+    ReplyNotVoice,
+    #[error("I can't see the author of the message you're replying to")]
+    ReplyUnknownAuthor,
+    #[error("I can't transcribe as that user has their trigger set to {0}")]
+    BadSummon(db::TranscribeTrigger),
+    #[error("No chat found titled: {0:?}")]
+    NoChatTitled(String),
+    #[error("Ambiguous request. Multiple chats were found with that title")]
+    AmbiguousChatTitle,
 }
 
 #[derive(Debug, ThisError)]
 pub enum DbError {
+    #[error("The database could not find its home")]
+    NoDataDir,
     #[error("The database is corrupt!! >>:V")]
     Corrupt,
     #[error("Failed reading the database. Error: {0}")]

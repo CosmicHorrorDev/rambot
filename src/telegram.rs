@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::Result;
+use crate::HandlerResult;
 
 use teloxide::{net::Download, payloads, requests::Requester, types};
 
@@ -20,7 +20,10 @@ impl Bot {
         Self(teloxide::Bot::from_env())
     }
 
-    pub async fn set_my_commands(&self, commands: Vec<types::BotCommand>) -> Result<()> {
+    pub async fn set_my_commands(
+        &self,
+        commands: Vec<types::BotCommand>,
+    ) -> Result<(), teloxide::RequestError> {
         log::debug!("Setting telegram commands");
         self.0.set_my_commands(commands).await?;
         Ok(())
@@ -31,7 +34,7 @@ impl Bot {
         chat_id: types::ChatId,
         reply_to: types::MessageId,
         text: S,
-    ) -> Result<Message> {
+    ) -> HandlerResult<Message> {
         let text = text.into();
         log::debug!("Sending reply to message {reply_to} text:\n{text}");
         let msg = <teloxide::Bot as Requester>::SendMessage::new(
@@ -50,7 +53,7 @@ impl Bot {
         })
     }
 
-    pub async fn download_file(&self, output_path: &Path, file_id: String) -> Result<()> {
+    pub async fn download_file(&self, output_path: &Path, file_id: String) -> HandlerResult {
         log::debug!("Downloading file {} to {}", file_id, output_path.display());
         let file_meta = self.0.get_file(file_id).await?;
         let mut file = tokio::fs::File::create(output_path).await?;
@@ -63,7 +66,7 @@ impl Bot {
         to_chat_id: types::ChatId,
         from_chat_id: types::ChatId,
         msg_id: types::MessageId,
-    ) -> Result<Message> {
+    ) -> HandlerResult<Message> {
         log::debug!("Forwarding message {msg_id} from {from_chat_id} to {to_chat_id}");
         let msg = self
             .0
@@ -93,7 +96,7 @@ impl Message {
         self.msg_id
     }
 
-    pub async fn edit_text<S: Into<String>>(&self, text: S) -> Result<()> {
+    pub async fn edit_text<S: Into<String>>(&self, text: S) -> HandlerResult {
         let text = text.into();
         log::debug!(
             "Editing message {} len {} snippet:\n{}",
@@ -111,10 +114,10 @@ impl Message {
         Ok(())
     }
 
-    pub async fn reply(&self, text: &str) -> Result<()> {
+    pub async fn reply<S: Into<String>>(&self, text: S) -> HandlerResult {
         let bot_ext = Bot::from(self.bot.clone());
         bot_ext
-            .send_message(self.chat_id, self.msg_id, text)
+            .send_message(self.chat_id, self.msg_id, text.into())
             .await?;
         Ok(())
     }

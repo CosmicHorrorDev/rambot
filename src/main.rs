@@ -17,10 +17,11 @@ mod telegram;
 mod transcriber;
 mod utils;
 
-use std::{env, sync::Arc, time::Instant};
+use std::{convert::Infallible, env, sync::OnceLock, time::Instant};
 
 use buf_messenger::UpdateMsgHandle;
-pub use error::{Error, Result};
+use db::TranscribeTrigger;
+pub use error::{HandlerError, HandlerResult, InitError, InitResult, UserError};
 
 use telegram::Message;
 use teloxide::{
@@ -29,18 +30,18 @@ use teloxide::{
     utils::command::{BotCommands, ParseError as CommandParseError},
 };
 
+static BOT_NAME: OnceLock<String> = OnceLock::new();
+
 #[derive(Clone)]
 struct State {
     transcriber_pool: transcriber::Pool,
     // TODO: move this into `telegram::Bot`
     send_msg_handle: buf_messenger::SendMsgHandle,
     db: db::Db,
-    // TODO: move this into `telegram::Bot`
-    bot_name: Arc<str>,
 }
 
 #[tokio::main]
-async fn main() -> Result {
+async fn main() -> InitResult {
     if let Err(e) = dotenvy::dotenv() {
         eprintln!(".env error: {e}");
     }
@@ -52,22 +53,22 @@ async fn main() -> Result {
     let bot = telegram::Bot::from_env();
     bot.set_my_commands(command::Command::bot_commands())
         .await
-        .unwrap();
+        .map_err(InitError::BotCommands)?;
     let handler = types::Update::filter_message().endpoint(
         |bot: teloxide::Bot, state: State, msg: types::Message| async move {
             handle_message(bot.into(), state, msg).await;
-            Ok::<(), ()>(())
+            Ok::<_, Infallible>(())
         },
     );
 
     let transcribers = transcriber::Pool::spawn(2).await;
     let send_msg_handle = buf_messenger::init(bot.clone());
-    let bot_name = env::var("BOT_NAME").map_err(Error::InvalidBotName)?.into();
+    let name = env::var("BOT_NAME").map_err(InitError::InvalidBotName)?;
+    BOT_NAME.get_or_init(|| name);
     let state = State {
         transcriber_pool: transcribers,
         send_msg_handle,
         db,
-        bot_name,
     };
     Dispatcher::builder(bot.0, handler)
         // The default distribution_function runs each chat sequentially. Run everything
@@ -104,8 +105,8 @@ impl Transcription {
         send_msg_handle: buf_messenger::SendMsgHandle,
         chat_id: types::ChatId,
         msg_id: types::MessageId,
-        sidecar_id: types::ChatId,
-    ) -> Result<Self> {
+        sidecar_id: Option<types::ChatId>,
+    ) -> HandlerResult<Self> {
         let status_text = status_text.into();
         if duration_secs <= SHORT_MSG_CUTOFF_SECS {
             let short_msg = send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
@@ -115,42 +116,51 @@ impl Transcription {
                 message: TranscriptionMessage::Short(short_msg),
             })
         } else {
+            let (long_msg_chat, long_msg_reply_to, maybe_sidecar) = match sidecar_id {
+                Some(sidecar_id) => {
+                    let forwarded = bot.forward_message(sidecar_id, chat_id, msg_id).await?;
+                    let forwarded_id = forwarded.id();
+                    let preview =
+                        send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
+                    let with_sidecar = WithSidecar { preview, forwarded };
+                    (sidecar_id, forwarded_id, Some(with_sidecar))
+                }
+                None => (chat_id, msg_id, None),
+            };
             // Oh lawd he ramblin
-            let forwarded = bot.forward_message(sidecar_id, chat_id, msg_id).await?;
-            let mut chunks = Vec::new();
-            let num_chunks = 1 + duration_secs / LONG_MSG_CHUNK_CUTOFF_SECS;
-            for index in 0..num_chunks {
+            let mut multipart = Vec::new();
+            let num_parts = 1 + duration_secs / LONG_MSG_CHUNK_CUTOFF_SECS;
+            for index in 0..num_parts {
                 let chunk = send_msg_handle.dispatch_send_msg(
-                    sidecar_id,
-                    forwarded.id(),
-                    &format!("[{}/{}] {}", index + 1, num_chunks, status_text),
+                    long_msg_chat,
+                    long_msg_reply_to,
+                    &format!("[{}/{}] {}", index + 1, num_parts, status_text),
                 )?;
-                chunks.push(chunk);
+                multipart.push(chunk);
             }
-            let preview = send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
 
             Ok(Self {
                 transcription: None,
                 status: Some(status_text),
                 message: TranscriptionMessage::Long(TranscriptionLong {
-                    preview,
-                    sidecar: Sidecar { forwarded, chunks },
+                    multipart,
+                    maybe_sidecar,
                 }),
             })
         }
     }
 
-    async fn update_status(&mut self, new_status: Option<&str>) -> Result {
+    async fn update_status(&mut self, new_status: Option<&str>) -> HandlerResult {
         self.status = new_status.map(ToOwned::to_owned);
         self.reflow_message().await
     }
 
-    async fn update_transcription(&mut self, new_transcription: Option<&str>) -> Result {
+    async fn update_transcription(&mut self, new_transcription: Option<&str>) -> HandlerResult {
         self.transcription = new_transcription.map(ToOwned::to_owned);
         self.reflow_message().await
     }
 
-    async fn reflow_message(&mut self) -> Result {
+    async fn reflow_message(&mut self) -> HandlerResult {
         match &mut self.message {
             TranscriptionMessage::Short(msg) => {
                 let transcription = self.transcription.as_deref().map(|transcription| {
@@ -173,10 +183,12 @@ impl Transcription {
             TranscriptionMessage::Long(long_msg) => {
                 if self.transcription.is_none() {
                     let status = self.status.as_deref().unwrap_or("");
-                    let _ = long_msg.preview.dispatch_edit_text(status);
-                    let num_chunks = long_msg.sidecar.chunks.len();
-                    for (i, chunk) in long_msg.sidecar.chunks.iter_mut().enumerate() {
-                        let msg_text = format!("[{}/{}] {}", i + 1, num_chunks, status);
+                    if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
+                        let _ = preview.dispatch_edit_text(status);
+                    }
+                    let num_parts = long_msg.multipart.len();
+                    for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
+                        let msg_text = format!("[{}/{}] {}", i + 1, num_parts, status);
                         let _ = chunk.dispatch_edit_text(msg_text);
                     }
 
@@ -185,13 +197,13 @@ impl Transcription {
                 }
 
                 let status = self.status.as_deref().unwrap_or("");
-                let lines = self
+                let lines: Vec<_> = self
                     .transcription
                     .as_deref()
                     .unwrap()
                     .lines()
                     .filter_map(utils::Line::new)
-                    .collect::<Vec<_>>();
+                    .collect();
                 let preview: Vec<_> = lines
                     .iter()
                     .cloned()
@@ -204,14 +216,14 @@ impl Transcription {
                     preview_text.push_str("\n...");
                 }
 
-                let _ = long_msg
-                    .preview
-                    .dispatch_edit_text(format!("{status}\n{preview_text}").trim());
+                if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
+                    let _ = preview.dispatch_edit_text(format!("{status}\n{preview_text}").trim());
+                }
 
                 let mut lines_iter = lines.iter().peekable();
                 let mut chunk_duration_limit = LONG_MSG_CHUNK_CUTOFF_SECS;
-                let num_chunks = long_msg.sidecar.chunks.len();
-                for (i, chunk) in long_msg.sidecar.chunks.iter_mut().enumerate() {
+                let num_chunks = long_msg.multipart.len();
+                for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
                     let mut chunk_lines = Vec::new();
                     while lines_iter
                         .peek()
@@ -238,220 +250,305 @@ impl Transcription {
         Ok(())
     }
 
-    pub async fn close(self) -> Result {
+    pub async fn close(self) -> HandlerResult {
         match self.message {
             TranscriptionMessage::Short(msg_handle) => msg_handle.close().await,
             TranscriptionMessage::Long(TranscriptionLong {
-                preview,
-                sidecar: Sidecar { chunks, .. },
+                multipart,
+                maybe_sidecar,
             }) => {
                 // TODO: closing all of these can be done concurrently
-                for chunk in chunks {
-                    chunk.close().await?;
+                for part in multipart {
+                    part.close().await?;
                 }
-                preview.close().await
+
+                if let Some(WithSidecar { preview, .. }) = maybe_sidecar {
+                    preview.close().await?;
+                }
+
+                Ok(())
             }
         }
     }
 }
 
 struct TranscriptionLong {
-    preview: UpdateMsgHandle,
-    sidecar: Sidecar,
+    maybe_sidecar: Option<WithSidecar>,
+    multipart: Vec<UpdateMsgHandle>,
 }
 
-struct Sidecar {
+struct WithSidecar {
     forwarded: Message,
-    chunks: Vec<UpdateMsgHandle>,
+    preview: UpdateMsgHandle,
 }
 
 async fn handle_message(bot: telegram::Bot, state: State, msg: types::Message) {
     let start = Instant::now();
 
     let on_err_reply_to = Message::new(bot.clone(), &msg);
-    if let Err(err) = try_handle_message(bot, state, msg.clone()).await {
-        log::warn!("Hit error: {err}");
-        let _ = on_err_reply_to
-            .reply(&format!(
-                "The bot hit an error while handling this message.\n{err}"
-            ))
-            .await;
-    }
-
+    let res = try_handle_message(bot, state, msg.clone()).await;
     log::info!("Handling message {} took {:?}", msg.id, start.elapsed());
+    if let Err(err) = res {
+        match err {
+            HandlerError::Ignore => { /* do as it says */ }
+            HandlerError::UserError(_) => {
+                let _ = on_err_reply_to.reply(err.to_string()).await;
+            }
+            _ => {
+                log::warn!("Hit error: {err}");
+                let msg = format!("The bot hit an error while handling this message.\n{err}");
+                let _ = on_err_reply_to.reply(msg).await;
+            }
+        }
+    }
 }
 
-// TODO: parse out commands and use that to determine our action once we get useful commands setup
-async fn try_handle_message(bot: telegram::Bot, state: State, msg: types::Message) -> Result {
+async fn try_handle_message(
+    bot: telegram::Bot,
+    state: State,
+    msg: types::Message,
+) -> HandlerResult {
     // New message means a potentially more up-to-date view of the world
     state.db.update_metadata(&msg).await?;
 
-    // We only interact with common messages
-    let types::MessageKind::Common(
-        common @ types::MessageCommon {
-            from: Some(from), ..
-        },
-    ) = &msg.kind
-    else {
-        log::debug!("Ignoring non-common or authorless message");
-        return Ok(());
-    };
+    // Now that we have that saved let's see if we care about this message
+    let RelevantMsg { meta, kind } = (&msg).try_into()?;
 
     // We only interact with users that we know
+    let from = meta.from.clone();
     let sender = state.db.user(from.id).await.expect("Already added");
     if !sender.is_trusted().await {
         log::debug!("Ignoring non-trusted user: {from:?}");
-        return Ok(());
+        return Err(HandlerError::Ignore);
     }
 
-    match &common.media_kind {
-        types::MediaKind::Text(text) => {
-            try_handle_text_message(bot, state, &msg, text, sender).await
+    match kind {
+        RelevantMsgKind::Command(com) => try_handle_command(bot, state, &meta, com, sender).await,
+        RelevantMsgKind::Voice(voice) => {
+            try_handle_voice_message(bot, state, &meta, voice, sender).await
         }
-        types::MediaKind::Voice(voice) => {
-            try_handle_voice_message(bot, state, &msg, voice, sender).await
-        }
-        _ => Ok(()),
     }
 }
 
-async fn try_handle_text_message(
+struct RelevantMsg {
+    meta: RelevantMeta,
+    kind: RelevantMsgKind,
+}
+
+impl TryFrom<&types::Message> for RelevantMsg {
+    type Error = HandlerError;
+
+    fn try_from(msg: &types::Message) -> Result<Self, Self::Error> {
+        let id = msg.id;
+        let chat_id = msg.chat.id;
+        let from = msg.from().ok_or(HandlerError::Ignore)?.to_owned();
+        let meta = RelevantMeta { id, chat_id, from };
+        let kind = msg.try_into()?;
+
+        Ok(Self { meta, kind })
+    }
+}
+
+struct RelevantMeta {
+    id: types::MessageId,
+    chat_id: types::ChatId,
+    from: types::User,
+}
+
+enum RelevantMsgKind {
+    Command(RelevantCommand),
+    Voice(types::Voice),
+}
+
+impl TryFrom<&types::Message> for RelevantMsgKind {
+    type Error = HandlerError;
+
+    fn try_from(msg: &types::Message) -> Result<Self, Self::Error> {
+        if let Some(text) = msg.text() {
+            let bot_name = BOT_NAME.get().unwrap();
+            let com = match command::Command::parse(text, &bot_name) {
+                // Probably just a regular text, so ignore
+                Err(CommandParseError::UnknownCommand(_) | CommandParseError::WrongBotName(_)) => {
+                    return Err(HandlerError::Ignore);
+                }
+                other => other,
+            }?;
+            let reply_to = msg.reply_to_message().map(Into::into);
+            let relevant_com = RelevantCommand { com, reply_to };
+            Ok(Self::Command(relevant_com))
+        } else if let Some(voice) = msg.voice() {
+            Ok(Self::Voice(voice.to_owned()))
+        } else {
+            Err(HandlerError::Ignore)
+        }
+    }
+}
+
+struct RelevantCommand {
+    com: command::Command,
+    reply_to: Option<RelevantParentMsg>,
+}
+
+struct RelevantParentMsg {
+    // TODO: chat_id and id shouldn't be optional
+    meta: Option<RelevantMeta>,
+    voice: Option<types::Voice>,
+}
+
+impl From<&types::Message> for RelevantParentMsg {
+    fn from(msg: &types::Message) -> Self {
+        let id = msg.id;
+        let chat_id = msg.chat.id;
+        let meta = msg.from().map(|from| {
+            let from = from.to_owned();
+            RelevantMeta { id, chat_id, from }
+        });
+        let voice = msg.voice().map(ToOwned::to_owned);
+        RelevantParentMsg { meta, voice }
+    }
+}
+
+struct Reply {
+    bot: telegram::Bot,
+    chat_id: types::ChatId,
+    msg_id: types::MessageId,
+}
+
+impl Reply {
+    fn new(bot: telegram::Bot, chat_id: types::ChatId, msg_id: types::MessageId) -> Self {
+        Self {
+            bot,
+            chat_id,
+            msg_id,
+        }
+    }
+
+    async fn send<S: Into<String>>(&self, text: S) -> HandlerResult<telegram::Message> {
+        let msg = self
+            .bot
+            .send_message(self.chat_id, self.msg_id, text.into())
+            .await?;
+        Ok(msg)
+    }
+}
+
+async fn try_handle_command(
     bot: telegram::Bot,
     state: State,
-    msg: &types::Message,
-    text: &types::MediaText,
+    meta: &RelevantMeta,
+    RelevantCommand { com, reply_to }: RelevantCommand,
     sender: db::DbUser,
-) -> Result {
-    // Try to parse out a valid command
-    let com = match command::Command::parse(&text.text, &state.bot_name) {
-        // Probably just a regular text, so ignore
-        Err(CommandParseError::UnknownCommand(_)) => return Ok(()),
-        other => other,
-    }?;
+) -> HandlerResult {
+    let reply = Reply::new(bot.clone(), meta.chat_id, meta.id);
 
     log::debug!("Running command: {com:?}");
     let db = &state.db;
     match com {
         command::Command::Vroom => {
-            bot.send_message(msg.chat.id, msg.id, "Vroom vroom\n🐏🛻💨💨")
-                .await?;
+            let start = tokio::time::Instant::now();
+            let msg = reply.send("Checking...").await?;
+            let elapsed = start.elapsed();
+            msg.edit_text(format!(
+                "Vroom vroom (sending took {elapsed:.01?})\n🐏🛻💨💨"
+            ))
+            .await?;
+            Ok(())
+        }
+        command::Command::Transcribe => {
+            // TODO: if it's a forward then check the trigger of the original author instead of the
+            // author of the forwarder
+            // Check the trigger of the sender
+            let parent_msg = reply_to.ok_or(UserError::ReplyNotVoice)?;
+            let parent_voice = parent_msg.voice.ok_or(UserError::ReplyNotVoice)?;
+            let parent_meta = parent_msg.meta.ok_or(UserError::ReplyUnknownAuthor)?;
+            let parent = &parent_meta.from;
+            let parent = db
+                .user(parent.id)
+                .await
+                .ok_or(UserError::ReplyUnknownAuthor)?;
+            let trigger = parent.get_transcribe_trigger().await;
+            match trigger {
+                TranscribeTrigger::Never => Err(UserError::BadSummon(trigger).into()),
+                TranscribeTrigger::SummonBySelf => {
+                    if parent == sender {
+                        try_handle_voice_message(bot, state, &parent_meta, parent_voice, sender)
+                            .await
+                    } else {
+                        Err(UserError::BadSummon(trigger).into())
+                    }
+                }
+                TranscribeTrigger::SummonByAny | TranscribeTrigger::Always => {
+                    try_handle_voice_message(bot, state, &parent_meta, parent_voice, sender).await
+                }
+            }
         }
         command::Command::AttachSidecar(title) => {
             match db.get_chat_ids_by_public_title(&title).await.as_slice() {
-                [] => {
-                    bot.send_message(
-                        msg.chat.id,
-                        msg.id,
-                        format!("No chat found called: {title:?}"),
-                    )
-                    .await?;
-                }
+                [] => Err(UserError::NoChatTitled(title).into()),
                 [sidecar] => {
-                    db.attach_sidecar(msg.chat.id, *sidecar).await?;
-                    bot.send_message(msg.chat.id, msg.id, "Sidecar attached successfully 💪🐏")
-                        .await?;
+                    db.attach_sidecar(meta.chat_id, *sidecar).await?;
+                    reply.send("Sidecar attached successfully 💪🐏").await?;
+                    Ok(())
                 }
-                [_, _, ..] => {
-                    bot.send_message(
-                        msg.chat.id,
-                        msg.id,
-                        "Ambiguous request. Multiple chats were found with that title",
-                    )
-                    .await?;
-                }
+                [_, _, ..] => Err(UserError::AmbiguousChatTitle.into()),
             }
         }
         command::Command::DetachSidecar => {
-            db.detach_sidecar(msg.chat.id).await?;
-            bot.send_message(msg.chat.id, msg.id, "Sidecar detached 🫨")
-                .await?;
+            db.detach_sidecar(meta.chat_id).await?;
+            reply.send("Sidecar detached 🫨").await?;
+            Ok(())
         }
         command::Command::GetTrigger => {
             let trigger = sender.get_transcribe_trigger().await;
-            bot.send_message(
-                msg.chat.id,
-                msg.id,
-                format!(
+            reply
+                .send(&format!(
                     "Your trigger is currently set to: {}\n{}",
-                    trigger.as_str(),
+                    trigger,
                     trigger.desc()
-                ),
-            )
-            .await?;
+                ))
+                .await?;
+            Ok(())
         }
         command::Command::SetTrigger(trigger) => {
             sender.set_transcribe_trigger(trigger).await?;
-            bot.send_message(msg.chat.id, msg.id, "Trigger updated 🔫🐏")
-                .await?;
+            reply.send("Trigger updated 🔫🐏").await?;
+            Ok(())
         }
         command::Command::AddUser(name) => {
-            let types::MessageKind::Common(common) = &msg.kind else {
-                // TODO: refactor to avoid having vv
-                unreachable!("This was already checked earlier");
-            };
-
-            let Some(parent_msg) = &common.reply_to_message else {
-                bot.send_message(
-                    msg.chat.id,
-                    msg.id,
-                    "Your message should be a reply to a message of the user getting added",
-                )
-                .await?;
-                return Ok(());
-            };
-
-            let maybe_parent_id = if let types::MessageKind::Common(common) = &parent_msg.kind {
-                common.from.as_ref().map(|user| user.id)
-            } else {
-                None
-            };
-
-            match maybe_parent_id {
-                None => {
-                    bot.send_message(
-                        msg.chat.id,
-                        msg.id,
-                        "I couldn't determine the author of the message you're replying to",
-                    )
-                    .await?;
-                }
-                Some(user_id) => {
-                    db.add_trusted_user(user_id, name.clone()).await?;
-                    bot.send_message(msg.chat.id, msg.id, format!("Added user {name} 🫡"))
-                        .await?;
-                }
-            }
+            let parent_msg = reply_to.as_ref().ok_or(UserError::NotReply)?;
+            let parent = parent_msg
+                .meta
+                .as_ref()
+                .ok_or(UserError::ReplyUnknownAuthor)?
+                .from
+                .to_owned();
+            db.add_trusted_user(parent.id, name.clone()).await?;
+            reply.send(&format!("Added user {name} 🫡")).await?;
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 async fn try_handle_voice_message(
     bot: telegram::Bot,
     state: State,
-    msg: &types::Message,
-    voice: &types::MediaVoice,
+    meta: &RelevantMeta,
+    voice: types::Voice,
     sender: db::DbUser,
-) -> Result {
+) -> HandlerResult {
     // TODO: Refactor to avoid `.unwrap()`
-    let maybe_sidecar_id = match state.db.get_sidecar_attach(msg.chat.id).await.unwrap() {
+    let maybe_sidecar_id = match state.db.get_sidecar_attach(meta.chat_id).await.unwrap() {
         // Sidecar chats are ignored
         Some(a) if a.self_kind == db::SidecarKind::IsSidecar => {
             log::debug!("Ignoring sidecar chat voice message");
-            return Ok(());
+            return Err(HandlerError::Ignore);
         }
         Some(a) => Some(a.to),
         None => None,
     };
 
-    let Some(sidecar_id) = maybe_sidecar_id else {
-        log::warn!("Actually implement this");
-        return Ok(());
-    };
-
-    let voice_file_id = &voice.voice.file.id;
-    let voice_msg_duration_secs = voice.voice.duration;
+    let voice_file_id = &voice.file.id;
+    let voice_msg_duration_secs = voice.duration;
 
     // Send our initial reply
     let mut bot_msg = Transcription::start(
@@ -459,9 +556,9 @@ async fn try_handle_voice_message(
         "Queued...",
         bot.clone(),
         state.send_msg_handle,
-        msg.chat.id,
-        msg.id,
-        sidecar_id,
+        meta.chat_id,
+        meta.id,
+        maybe_sidecar_id,
     )
     .await?;
 
@@ -474,10 +571,12 @@ async fn try_handle_voice_message(
         )
         .await;
 
-    let download_started = job.await.map_err(Error::worker_died)?;
+    let download_started = job.await.map_err(HandlerError::worker_died)?;
     let _ = bot_msg.update_status(Some("Downloading...")).await;
-    let downloading = download_started.await.map_err(Error::worker_died)??;
-    let mut transcribing = downloading.await.map_err(Error::worker_died)??;
+    let downloading = download_started
+        .await
+        .map_err(HandlerError::worker_died)??;
+    let mut transcribing = downloading.await.map_err(HandlerError::worker_died)??;
     let _ = bot_msg.update_status(Some("Transcribing...")).await;
 
     while let Some(transcription) = transcribing.next().await? {

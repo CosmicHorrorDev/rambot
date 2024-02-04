@@ -7,6 +7,8 @@ use teloxide::utils::command::BotCommands;
 pub enum Command {
     #[command(description = "Vroom vroom mother trucker ;V")]
     Vroom,
+    #[command(description = "Manually transcribe the voice message")]
+    Transcribe,
     #[command(description = "Attach a sidecar for longer voice messages")]
     AttachSidecar(String),
     #[command(description = "Detach the sidecar for/from this chat")]
