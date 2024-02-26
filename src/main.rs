@@ -17,7 +17,7 @@ mod telegram;
 mod transcriber;
 mod utils;
 
-use std::{convert::Infallible, env, sync::OnceLock, time::Instant};
+use std::{convert::Infallible, sync::OnceLock, time::Instant};
 
 use buf_messenger::UpdateMsgHandle;
 use db::TranscribeTrigger;
@@ -29,6 +29,7 @@ use teloxide::{
     types,
     utils::command::{BotCommands, ParseError as CommandParseError},
 };
+use utils::Line;
 
 static BOT_NAME: OnceLock<String> = OnceLock::new();
 
@@ -63,7 +64,12 @@ async fn main() -> InitResult {
 
     let transcribers = transcriber::Pool::spawn(2).await;
     let send_msg_handle = buf_messenger::init(bot.clone());
-    let name = env::var("BOT_NAME").map_err(InitError::InvalidBotName)?;
+    let name = bot
+        .get_me()
+        .await
+        .ok()
+        .and_then(|me| me.user.username)
+        .ok_or(InitError::InvalidBotName)?;
     BOT_NAME.get_or_init(|| name);
     let state = State {
         transcriber_pool: transcribers,
@@ -84,17 +90,12 @@ async fn main() -> InitResult {
 }
 
 const SHORT_MSG_CUTOFF_SECS: u32 = 45;
-const LONG_MSG_CHUNK_CUTOFF_SECS: u32 = 300;
+const LONG_MSG_CHUNK_CUTOFF_SECS: u32 = 240;
 
 struct Transcription {
-    transcription: Option<String>,
+    transcription: Vec<Line>,
     status: Option<String>,
-    message: TranscriptionMessage,
-}
-
-enum TranscriptionMessage {
-    Short(UpdateMsgHandle),
-    Long(TranscriptionLong),
+    message: TranscriptionLong,
 }
 
 impl Transcription {
@@ -108,46 +109,35 @@ impl Transcription {
         sidecar_id: Option<types::ChatId>,
     ) -> HandlerResult<Self> {
         let status_text = status_text.into();
-        if duration_secs <= SHORT_MSG_CUTOFF_SECS {
-            let short_msg = send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
-            Ok(Self {
-                transcription: None,
-                status: Some(status_text),
-                message: TranscriptionMessage::Short(short_msg),
-            })
-        } else {
-            let (long_msg_chat, long_msg_reply_to, maybe_sidecar) = match sidecar_id {
-                Some(sidecar_id) => {
-                    let forwarded = bot.forward_message(sidecar_id, chat_id, msg_id).await?;
-                    let forwarded_id = forwarded.id();
-                    let preview =
-                        send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
-                    let with_sidecar = WithSidecar { preview, forwarded };
-                    (sidecar_id, forwarded_id, Some(with_sidecar))
-                }
-                None => (chat_id, msg_id, None),
-            };
-            // Oh lawd he ramblin
-            let mut multipart = Vec::new();
-            let num_parts = 1 + duration_secs / LONG_MSG_CHUNK_CUTOFF_SECS;
-            for index in 0..num_parts {
-                let chunk = send_msg_handle.dispatch_send_msg(
-                    long_msg_chat,
-                    long_msg_reply_to,
-                    &format!("[{}/{}] {}", index + 1, num_parts, status_text),
-                )?;
-                multipart.push(chunk);
+        let (long_msg_chat, long_msg_reply_to, maybe_sidecar) = match sidecar_id {
+            Some(sidecar_id) => {
+                let forwarded = bot.forward_message(sidecar_id, chat_id, msg_id).await?;
+                let forwarded_id = forwarded.id();
+                let preview = send_msg_handle.dispatch_send_msg(chat_id, msg_id, &status_text)?;
+                let with_sidecar = WithSidecar { preview, forwarded };
+                (sidecar_id, forwarded_id, Some(with_sidecar))
             }
-
-            Ok(Self {
-                transcription: None,
-                status: Some(status_text),
-                message: TranscriptionMessage::Long(TranscriptionLong {
-                    multipart,
-                    maybe_sidecar,
-                }),
-            })
+            None => (chat_id, msg_id, None),
+        };
+        let mut multipart = Vec::new();
+        let num_parts = 1 + duration_secs / LONG_MSG_CHUNK_CUTOFF_SECS;
+        for index in 0..num_parts {
+            let chunk = send_msg_handle.dispatch_send_msg(
+                long_msg_chat,
+                long_msg_reply_to,
+                &format!("[{}/{}] {}", index + 1, num_parts, status_text),
+            )?;
+            multipart.push(chunk);
         }
+
+        Ok(Self {
+            transcription: Vec::new(),
+            status: Some(status_text),
+            message: TranscriptionLong {
+                multipart,
+                maybe_sidecar,
+            },
+        })
     }
 
     async fn update_status(&mut self, new_status: Option<&str>) -> HandlerResult {
@@ -155,120 +145,88 @@ impl Transcription {
         self.reflow_message().await
     }
 
-    async fn update_transcription(&mut self, new_transcription: Option<&str>) -> HandlerResult {
-        self.transcription = new_transcription.map(ToOwned::to_owned);
+    async fn push_line(&mut self, line: Line) -> HandlerResult {
+        self.transcription.push(line);
         self.reflow_message().await
     }
 
     async fn reflow_message(&mut self) -> HandlerResult {
-        match &mut self.message {
-            TranscriptionMessage::Short(msg) => {
-                let transcription = self.transcription.as_deref().map(|transcription| {
-                    transcription
-                        .lines()
-                        .filter_map(|line| {
-                            let line = utils::Line::new(line)?;
-                            Some(line.into_telegram_line())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                });
-                let msg_text = match (self.status.as_deref(), transcription.as_deref()) {
-                    (Some(status), Some(transcription)) => format!("{status}\n{transcription}"),
-                    (Some(lone), None) | (None, Some(lone)) => lone.to_owned(),
-                    (None, None) => String::new(),
-                };
-                msg.dispatch_edit_text(msg_text)?;
+        let long_msg = &mut self.message;
+        if self.transcription.is_empty() {
+            let status = self.status.as_deref().unwrap_or("");
+            if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
+                let _ = preview.dispatch_edit_text(status);
             }
-            TranscriptionMessage::Long(long_msg) => {
-                if self.transcription.is_none() {
-                    let status = self.status.as_deref().unwrap_or("");
-                    if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
-                        let _ = preview.dispatch_edit_text(status);
-                    }
-                    let num_parts = long_msg.multipart.len();
-                    for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
-                        let msg_text = format!("[{}/{}] {}", i + 1, num_parts, status);
-                        let _ = chunk.dispatch_edit_text(msg_text);
-                    }
-
-                    // TODO: this is bad code style, use a match
-                    return Ok(());
-                }
-
-                let status = self.status.as_deref().unwrap_or("");
-                let lines: Vec<_> = self
-                    .transcription
-                    .as_deref()
-                    .unwrap()
-                    .lines()
-                    .filter_map(utils::Line::new)
-                    .collect();
-                let preview: Vec<_> = lines
-                    .iter()
-                    .cloned()
-                    .take_while(|line| line.end_secs < SHORT_MSG_CUTOFF_SECS)
-                    .map(utils::Line::into_telegram_line)
-                    .collect();
-                let preview_is_truncated = lines.len() > preview.len();
-                let mut preview_text = format!("Preview:\n{}", preview.join("\n"));
-                if preview_is_truncated {
-                    preview_text.push_str("\n...");
-                }
-
-                if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
-                    let _ = preview.dispatch_edit_text(format!("{status}\n{preview_text}").trim());
-                }
-
-                let mut lines_iter = lines.iter().peekable();
-                let mut chunk_duration_limit = LONG_MSG_CHUNK_CUTOFF_SECS;
-                let num_chunks = long_msg.multipart.len();
-                for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
-                    let mut chunk_lines = Vec::new();
-                    while lines_iter
-                        .peek()
-                        .map_or(false, |line| line.end_secs < chunk_duration_limit)
-                    {
-                        let line = lines_iter.next().expect("Peeked");
-                        chunk_lines.push(line.to_owned().into_telegram_line());
-                    }
-                    let _ = chunk.dispatch_edit_text(
-                        format!(
-                            "[{}/{}] {}\n{}",
-                            i + 1,
-                            num_chunks,
-                            status,
-                            chunk_lines.join("\n")
-                        )
-                        .trim(),
-                    );
-                    chunk_duration_limit += LONG_MSG_CHUNK_CUTOFF_SECS;
-                }
+            let num_parts = long_msg.multipart.len();
+            for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
+                let msg_text = format!("[{}/{}] {}", i + 1, num_parts, status);
+                let _ = chunk.dispatch_edit_text(msg_text);
             }
+
+            // TODO: this is bad code style, use a match
+            return Ok(());
+        }
+
+        let status = self.status.as_deref().unwrap_or("");
+        let preview: Vec<_> = self
+            .transcription
+            .iter()
+            .take_while(|line| line.end_secs < SHORT_MSG_CUTOFF_SECS)
+            .map(utils::Line::to_telegram_line)
+            .collect();
+        let preview_is_truncated = self.transcription.len() > preview.len();
+        let mut preview_text = format!("Preview:\n{}", preview.join("\n"));
+        if preview_is_truncated {
+            preview_text.push_str("\n...");
+        }
+
+        if let Some(WithSidecar { preview, .. }) = &mut long_msg.maybe_sidecar {
+            let _ = preview.dispatch_edit_text(format!("{status}\n{preview_text}").trim());
+        }
+
+        let mut lines_iter = self.transcription.iter().peekable();
+        let mut chunk_duration_limit = LONG_MSG_CHUNK_CUTOFF_SECS;
+        let num_chunks = long_msg.multipart.len();
+        for (i, chunk) in long_msg.multipart.iter_mut().enumerate() {
+            let mut chunk_lines = Vec::new();
+            while lines_iter
+                .peek()
+                .map_or(false, |line| line.end_secs < chunk_duration_limit)
+            {
+                let line = lines_iter.next().expect("Peeked");
+                chunk_lines.push(line.to_telegram_line());
+            }
+            let _ = chunk.dispatch_edit_text(
+                format!(
+                    "[{}/{}] {}\n{}",
+                    i + 1,
+                    num_chunks,
+                    status,
+                    chunk_lines.join("\n")
+                )
+                .trim(),
+            );
+            chunk_duration_limit += LONG_MSG_CHUNK_CUTOFF_SECS;
         }
 
         Ok(())
     }
 
     pub async fn close(self) -> HandlerResult {
-        match self.message {
-            TranscriptionMessage::Short(msg_handle) => msg_handle.close().await,
-            TranscriptionMessage::Long(TranscriptionLong {
-                multipart,
-                maybe_sidecar,
-            }) => {
-                // TODO: closing all of these can be done concurrently
-                for part in multipart {
-                    part.close().await?;
-                }
-
-                if let Some(WithSidecar { preview, .. }) = maybe_sidecar {
-                    preview.close().await?;
-                }
-
-                Ok(())
-            }
+        let TranscriptionLong {
+            multipart,
+            maybe_sidecar,
+        } = self.message;
+        // TODO: closing all of these can be done concurrently
+        for part in multipart {
+            part.close().await?;
         }
+
+        if let Some(WithSidecar { preview, .. }) = maybe_sidecar {
+            preview.close().await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -325,7 +283,11 @@ async fn try_handle_message(
     match kind {
         RelevantMsgKind::Command(com) => try_handle_command(bot, state, &meta, com, sender).await,
         RelevantMsgKind::Voice(voice) => {
-            try_handle_voice_message(bot, state, &meta, voice, sender).await
+            let trigger = sender.get_transcribe_trigger().await;
+            if trigger == TranscribeTrigger::Always {
+                try_handle_voice_message(bot, state, &meta, voice, sender).await?;
+            }
+            Ok(())
         }
     }
 }
@@ -483,10 +445,10 @@ async fn try_handle_command(
             }
         }
         command::Command::AttachSidecar(title) => {
-            match db.get_chat_ids_by_public_title(&title).await.as_slice() {
+            match *db.get_chat_ids_by_public_title(&title).await {
                 [] => Err(UserError::NoChatTitled(title).into()),
                 [sidecar] => {
-                    db.attach_sidecar(meta.chat_id, *sidecar).await?;
+                    db.attach_sidecar(meta.chat_id, sidecar).await?;
                     reply.send("Sidecar attached successfully 💪🐏").await?;
                     Ok(())
                 }
@@ -515,14 +477,9 @@ async fn try_handle_command(
             Ok(())
         }
         command::Command::AddUser(name) => {
-            let parent_msg = reply_to.as_ref().ok_or(UserError::NotReply)?;
-            let parent = parent_msg
-                .meta
-                .as_ref()
-                .ok_or(UserError::ReplyUnknownAuthor)?
-                .from
-                .to_owned();
-            db.add_trusted_user(parent.id, name.clone()).await?;
+            let parent_msg = reply_to.ok_or(UserError::NotReply)?;
+            let meta = parent_msg.meta.ok_or(UserError::ReplyUnknownAuthor)?;
+            db.add_trusted_user(meta.from.id, name.clone()).await?;
             reply.send(&format!("Added user {name} 🫡")).await?;
             Ok(())
         }
@@ -579,8 +536,8 @@ async fn try_handle_voice_message(
     let mut transcribing = downloading.await.map_err(HandlerError::worker_died)??;
     let _ = bot_msg.update_status(Some("Transcribing...")).await;
 
-    while let Some(transcription) = transcribing.next().await? {
-        let _ = bot_msg.update_transcription(Some(&transcription)).await;
+    while let Some(line) = transcribing.next().await? {
+        let _ = bot_msg.push_line(line).await;
     }
 
     bot_msg.update_status(None).await?;

@@ -53,23 +53,18 @@ impl Pool {
 // TODO: keep the model around and use a timeout
 async fn run_worker(rx: async_channel::Receiver<JobFut>, id: u8) {
     while let Ok(job) = rx.recv().await {
-        let voice_msg_path = format!("/tmp/voice_msg_{id}.ogg");
         log::info!("Worker {} got work {}", id, job.meta.voice_file_id);
-        if run_transcription_process(job, voice_msg_path)
-            .await
-            .is_none()
-        {
+        if run_transcription_process(job).await.is_none() {
             log::warn!("Transcription job died. Oh well");
         }
     }
 }
 
-async fn run_transcription_process(job: JobFut, voice_msg_path: String) -> Option<()> {
-    let duration = job.meta.voice_msg_duration_secs;
+async fn run_transcription_process(job: JobFut) -> Option<()> {
     job.start_download()?
-        .finish_download(voice_msg_path.clone())
+        .finish_download()
         .await?
         .start_transcription()?
-        .finish_transcription(voice_msg_path, duration)
+        .finish_transcription()
         .await
 }

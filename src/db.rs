@@ -82,17 +82,15 @@ impl Db {
 
     pub async fn update_metadata(&self, msg: &types::Message) -> HandlerResult {
         self.dump_after(|inner| {
-            let chat = inner
+            let kind = ChatKind::from(&msg.chat.kind);
+            inner
                 .chats
                 .entry(msg.chat.id)
-                .or_insert_with(|| Chat::new(ChatKind::Private));
-            chat.kind = ChatKind::from(&msg.chat.kind);
+                .and_modify(|entry| entry.kind = kind.clone())
+                .or_insert_with(|| Chat::new(kind));
 
-            if let types::MessageKind::Common(types::MessageCommon {
-                from: Some(user), ..
-            }) = &msg.kind
-            {
-                inner.users.entry(user.id).or_default();
+            if let Some(from) = msg.from() {
+                inner.users.entry(from.id).or_default();
             }
 
             Ok(())

@@ -1,4 +1,4 @@
-use std::{env, io, result::Result as StdResult};
+use std::{io, result::Result as StdResult};
 
 use crate::db;
 
@@ -15,8 +15,8 @@ pub enum InitError {
     BotCommands(teloxide::RequestError),
     #[error("Failed loading the database: {0}")]
     DbLoad(#[from] DbError),
-    #[error("`$BOT_NAME` should be set to the bot's name. Error: {0}")]
-    InvalidBotName(env::VarError),
+    #[error("Unable to detect bot name")]
+    InvalidBotName,
 }
 
 #[derive(Debug, ThisError)]

@@ -54,7 +54,7 @@ impl UpdateMsgHandle {
             .map_err(|_| HandlerError::UpdateMsgWorkerDied)?;
         while let Ok(resp) = self.resp_rx.try_recv() {
             match resp {
-                MsgResp::Flush => unreachable!("Should never be seen outside a `.flush()` call"),
+                MsgResp::Flush(_) => unreachable!("Should never be seen outside a `.flush()` call"),
                 MsgResp::Error(e) => return Err(e),
             }
         }
@@ -81,7 +81,13 @@ impl UpdateMsgHandle {
                     log::info!("Captured delayed error: {e}");
                     delayed_error = Some(e)
                 }
-                Some(MsgResp::Flush) => break Ok(()),
+                Some(MsgResp::Flush(None)) => {
+                    break match delayed_error {
+                        Some(err) => Err(err),
+                        None => Ok(()),
+                    }
+                }
+                Some(MsgResp::Flush(Some(err))) => break Err(err),
             }
         }
     }
@@ -106,7 +112,7 @@ enum UpdateReq {
 }
 
 enum MsgResp {
-    Flush,
+    Flush(Option<HandlerError>),
     Error(HandlerError),
 }
 
@@ -140,7 +146,7 @@ async fn run_update_worker(
 ) {
     while let Some(req) = rx.recv().await {
         match req {
-            UpdateReq::Flush => _ = tx.send(MsgResp::Flush),
+            UpdateReq::Flush => _ = tx.send(MsgResp::Flush(None)),
             UpdateReq::Edit(mut text) => {
                 let slight_delay = time::Instant::now() + Duration::from_millis(200);
                 let mut flush_after = false;
@@ -180,7 +186,7 @@ async fn run_update_worker(
                 }
 
                 if flush_after {
-                    let _ = tx.send(MsgResp::Flush);
+                    let _ = tx.send(MsgResp::Flush(None));
                 }
             }
         }

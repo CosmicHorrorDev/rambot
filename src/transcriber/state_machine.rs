@@ -4,14 +4,15 @@
 //! state machine where the *Fut side automatically emits updates to the non-*Fut side that expand
 //! out to follow the state machine's flow
 
-use std::{io::Read, path::Path, process::Stdio, sync::Arc};
+use std::{process::Stdio, sync::Arc};
 
-use crate::{telegram::Bot, HandlerError, HandlerResult};
+use crate::{telegram::Bot, utils::SegmentCallbackData, HandlerError, HandlerResult, Line};
 
 use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot, Mutex},
 };
+use whisper_rs::{FullParams, WhisperContext, WhisperContextParameters};
 
 // TODO: provide some kind of constructor
 // TODO: wrap non-fut so that we can expose a meaningful error directly?
@@ -45,7 +46,7 @@ pub struct DownloadStartedFut {
 }
 
 impl DownloadStartedFut {
-    pub async fn finish_download(self, voice_msg_path: String) -> Option<DownloadingFut> {
+    pub async fn finish_download(self) -> Option<DownloadingFut> {
         let Self {
             next,
             meta: JobMeta {
@@ -54,15 +55,52 @@ impl DownloadStartedFut {
         } = self;
         let (tx, rx) = oneshot::channel();
 
-        if let Err(e) = bot
-            .download_file(Path::new(&voice_msg_path), voice_file_id)
-            .await
-        {
+        // TODO: tempdir here to download into
+        let ogg_file = tempfile::Builder::new()
+            .prefix("rambot")
+            .suffix(".ogg")
+            .tempfile()
+            .unwrap();
+        let ogg_path = ogg_file.path();
+
+        if let Err(e) = bot.download_file(ogg_path, voice_file_id).await {
             next.send(Err(e.into())).ok()?;
             None
         } else {
+            // TODO: switch to symphonia once they have an opus decoder
+            let wav_file = tempfile::Builder::new()
+                .prefix("rambot")
+                .suffix(".wav")
+                .tempfile()
+                .unwrap();
+            let wav_path = wav_file.path();
+            #[rustfmt::skip]
+            std::process::Command::new("ffmpeg")
+                .arg("-i").arg(ogg_path)
+                // Convert to i16 LE samples because that's what the example used
+                .arg("-acodec").arg("pcm_s16le")
+                // 16kHz
+                .arg("-ar").arg("16000")
+                // Skip confirmation
+                .arg("-y")
+                .arg(wav_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+
+            let wav_reader = hound::WavReader::open(wav_path).unwrap();
+            let audio_data: Vec<_> = wav_reader
+                .into_samples::<i16>()
+                .map(|x| x.unwrap())
+                .collect();
+            let audio_data = whisper_rs::convert_integer_to_float_audio(&audio_data);
+
             next.send(Ok(rx)).ok()?;
-            Some(DownloadingFut(tx))
+            Some(DownloadingFut {
+                next: tx,
+                audio_data,
+            })
         }
     }
 }
@@ -71,74 +109,49 @@ impl DownloadStartedFut {
 pub type Downloading = oneshot::Receiver<HandlerResult<Transcribing>>;
 
 #[must_use]
-pub struct DownloadingFut(oneshot::Sender<HandlerResult<Transcribing>>);
+pub struct DownloadingFut {
+    next: oneshot::Sender<HandlerResult<Transcribing>>,
+    audio_data: Vec<f32>,
+}
 
 impl DownloadingFut {
     pub fn start_transcription(self) -> Option<TranscribingFut> {
+        let Self { next, audio_data } = self;
         let (msg_handle, transcriber_handle) = mpsc::channel(16);
         let shared_transcription = Arc::default();
-        self.0
-            .send(Ok(Transcribing {
-                finished: false,
-                transcriber_handle,
-                shared_transcription: Arc::clone(&shared_transcription),
-            }))
-            .ok()?;
+        next.send(Ok(Transcribing {
+            finished: false,
+            transcriber_handle,
+            shared_transcription: Arc::clone(&shared_transcription),
+        }))
+        .ok()?;
         Some(TranscribingFut {
             msg_handle,
             shared_transcription,
+            audio_data,
         })
     }
 }
 
 #[must_use]
 pub struct Transcribing {
-    // TODO: switch this over to a tokio::sync::watch channel
     finished: bool,
     transcriber_handle: mpsc::Receiver<HandlerResult<Update>>,
     shared_transcription: Arc<Mutex<String>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Update {
-    InProgress,
-    Finished,
-}
-
 impl Transcribing {
-    pub async fn next(&mut self) -> HandlerResult<Option<String>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        let mut maybe_update = self
+    pub async fn next(&mut self) -> HandlerResult<Option<Line>> {
+        let maybe_update = self
             .transcriber_handle
             .recv()
             .await
             .ok_or(HandlerError::WorkerDied)?;
-        // Skip any queued in-progress updates
-        while maybe_update
-            .as_ref()
-            .map_or(false, |&update| update == Update::InProgress)
-        {
-            match self.transcriber_handle.try_recv() {
-                Ok(next) => maybe_update = next,
-                Err(_) => break,
-            }
-        }
 
-        match maybe_update {
-            Ok(Update::InProgress) => {
-                let transcription = self.shared_transcription.lock().await.to_owned();
-                Ok(Some(transcription))
-            }
-            Ok(Update::Finished) => {
-                self.finished = true;
-                let transcription = self.shared_transcription.lock().await.to_owned();
-                Ok(Some(transcription))
-            }
-            Err(err) => Err(err),
-        }
+        maybe_update.map(|update| match update {
+            Update::Line(line) => Some(line),
+            Update::Eof => None,
+        })
     }
 }
 
@@ -146,22 +159,14 @@ impl Transcribing {
 pub struct TranscribingFut {
     msg_handle: mpsc::Sender<HandlerResult<Update>>,
     shared_transcription: Arc<Mutex<String>>,
+    audio_data: Vec<f32>,
 }
 
 impl TranscribingFut {
-    pub async fn finish_transcription(self, voice_msg_path: String, duration: u32) -> Option<()> {
-        // Do slower transcriptions on longer messages just while this is running on weaker
-        // hardware
-        // TODO: remove after we get setup on a GPU
-        let num_threads = if duration > 10 * 60 { "2" } else { "4" };
-
+    pub async fn finish_transcription(self) -> Option<()> {
         let fut = self.clone();
-        let res = match tokio::task::spawn_blocking(move || {
-            run_sync_process(voice_msg_path, num_threads, fut)
-        })
-        .await
-        {
-            Ok(Ok(())) => Ok(Update::Finished),
+        let res = match tokio::task::spawn_blocking(move || run_sync_process(fut)).await {
+            Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
                 log::warn!("Sync process wrapper returned an error: {err}");
                 Err(err)
@@ -172,49 +177,73 @@ impl TranscribingFut {
             }
         };
 
-        self.msg_handle.send(res).await.ok()
+        if let Err(e) = res {
+            self.msg_handle.send(Err(e)).await.ok()?;
+        }
+
+        Some(())
     }
 }
 
-fn run_sync_process(
-    voice_msg_path: String,
-    num_threads: &'static str,
-    fut: TranscribingFut,
-) -> HandlerResult {
-    let handle = Handle::current();
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Update {
+    Line(Line),
+    Eof,
+}
+
+impl From<Line> for Update {
+    fn from(line: Line) -> Self {
+        Self::Line(line)
+    }
+}
+
+impl From<SegmentCallbackData> for Update {
+    fn from(segment: SegmentCallbackData) -> Self {
+        Self::Line(segment.into())
+    }
+}
+
+fn run_sync_process(fut: TranscribingFut) -> HandlerResult {
     let TranscribingFut {
         shared_transcription,
         msg_handle,
+        audio_data,
     } = fut;
 
-    // `whisper` is too smart and pipes its output when it detects a non-interactive stdout, so
-    // we have to fake being a tty to get it to stream for us. This also seems to fuck up the
-    // logs formatting unfortunately.
-    let mut whisper_stdout = fake_tty::bash_command(&format!(
-        "whisper {voice_msg_path} --model small.en --thread {num_threads} --fp16 False"
-    ))?
-    .stderr(Stdio::null())
-    .spawn()?
-    .stdout
-    .expect("We need stdout");
-    let mut read_buf = vec![0; 4_096];
-    loop {
-        let bytes_read = whisper_stdout.read(&mut read_buf)?;
-        let utf8_snippet = std::str::from_utf8(&read_buf[..bytes_read])?;
-        handle.block_on(async {
-            {
-                shared_transcription.lock().await.push_str(utf8_snippet);
-            }
-            msg_handle
-                .send(Ok(Update::InProgress))
-                .await
-                .map_err(|_| HandlerError::MessageHandleDied)
-        })?;
+    let model_path = dirs::data_dir().unwrap().join("rambot").join("model.bin");
+    let params = WhisperContextParameters::new();
+    let ctx = WhisperContext::new_with_params(model_path.to_str().unwrap(), params).unwrap();
+    let mut state = ctx.create_state().unwrap();
+    let mut params = FullParams::new(Default::default());
+    // let (tx, _) = tokio::sync::mpsc::unbounded_channel::<()>();
+    params.set_no_context(true);
+    // TODO: This callback segfaults... Need to minimize and report the issue upstream
+    // let msg_handle2 = msg_handle.clone();
+    // params.set_progress_callback_safe(move |_| {
+    //     Handle::current().block_on(async {
+    //         let _ = tx.send(());
+    //     });
+    // });
 
-        if bytes_read == 0 {
-            break;
+    // Actually run the model on the audio file
+    state.full(params, &audio_data).unwrap();
+
+    Handle::current().block_on(async {
+        let n_segments = state.full_n_segments().unwrap();
+        for i in 0..n_segments {
+            let start_timestamp = state.full_get_segment_t0(i).unwrap();
+            let end_timestamp = state.full_get_segment_t1(i).unwrap();
+            let text = state.full_get_segment_text(i).unwrap();
+            let segment = SegmentCallbackData {
+                segment: i,
+                start_timestamp,
+                end_timestamp,
+                text,
+            };
+            let _ = msg_handle.send(Ok(segment.into())).await;
         }
-    }
+        let _ = msg_handle.send(Ok(Update::Eof)).await;
+    });
 
     Ok(())
 }

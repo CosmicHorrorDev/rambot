@@ -20,6 +20,11 @@ impl Bot {
         Self(teloxide::Bot::from_env())
     }
 
+    pub async fn get_me(&self) -> Result<types::Me, teloxide::RequestError> {
+        log::debug!("Getting me");
+        self.0.get_me().await
+    }
+
     pub async fn set_my_commands(
         &self,
         commands: Vec<types::BotCommand>,
