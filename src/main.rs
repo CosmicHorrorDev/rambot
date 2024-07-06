@@ -25,6 +25,7 @@ pub use error::{HandlerError, HandlerResult, InitError, InitResult, UserError};
 
 use telegram::Message;
 use teloxide::{
+    adaptors,
     dispatching::{Dispatcher, UpdateFilterExt},
     types,
     utils::command::{BotCommands, ParseError as CommandParseError},
@@ -56,7 +57,7 @@ async fn main() -> InitResult {
         .await
         .map_err(InitError::BotCommands)?;
     let handler = types::Update::filter_message().endpoint(
-        |bot: teloxide::Bot, state: State, msg: types::Message| async move {
+        |bot: adaptors::Throttle<teloxide::Bot>, state: State, msg: types::Message| async move {
             handle_message(bot.into(), state, msg).await;
             Ok::<_, Infallible>(())
         },
@@ -90,7 +91,7 @@ async fn main() -> InitResult {
 }
 
 const SHORT_MSG_CUTOFF_SECS: u32 = 45;
-const LONG_MSG_CHUNK_CUTOFF_SECS: u32 = 240;
+const LONG_MSG_CHUNK_CUTOFF_SECS: u32 = 210;
 
 struct Transcription {
     transcription: Vec<Line>,
@@ -507,6 +508,8 @@ async fn try_handle_voice_message(
     let voice_file_id = &voice.file.id;
     let voice_msg_duration_secs = voice.duration;
 
+    // TODO: refactor this so that the initial message doesn't send more than one, and then after
+    // the download finishes it sends the rest
     // Send our initial reply
     let mut bot_msg = Transcription::start(
         voice_msg_duration_secs,

@@ -90,16 +90,17 @@ impl DownloadStartedFut {
                 .unwrap();
 
             let wav_reader = hound::WavReader::open(wav_path).unwrap();
-            let audio_data: Vec<_> = wav_reader
+            let int_audio: Vec<_> = wav_reader
                 .into_samples::<i16>()
                 .map(|x| x.unwrap())
                 .collect();
-            let audio_data = whisper_rs::convert_integer_to_float_audio(&audio_data);
+            let mut float_audio = vec![0.0; int_audio.len()];
+            whisper_rs::convert_integer_to_float_audio(&int_audio, &mut float_audio).ok()?;
 
             next.send(Ok(rx)).ok()?;
             Some(DownloadingFut {
                 next: tx,
-                audio_data,
+                audio_data: float_audio,
             })
         }
     }
@@ -215,9 +216,9 @@ fn run_sync_process(fut: TranscribingFut) -> HandlerResult {
     let ctx = WhisperContext::new_with_params(model_path.to_str().unwrap(), params).unwrap();
     let mut state = ctx.create_state().unwrap();
     let mut params = FullParams::new(Default::default());
-    // let (tx, _) = tokio::sync::mpsc::unbounded_channel::<()>();
     params.set_no_context(true);
     // TODO: This callback segfaults... Need to minimize and report the issue upstream
+    // let (tx, _) = tokio::sync::mpsc::unbounded_channel::<()>();
     // let msg_handle2 = msg_handle.clone();
     // params.set_progress_callback_safe(move |_| {
     //     Handle::current().block_on(async {

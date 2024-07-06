@@ -4,20 +4,26 @@ use std::path::Path;
 
 use crate::HandlerResult;
 
-use teloxide::{net::Download, payloads, requests::Requester, types};
+use teloxide::{
+    adaptors,
+    net::Download,
+    payloads,
+    requests::{HasPayload, Requester, RequesterExt},
+    types,
+};
 
 #[derive(Clone)]
-pub struct Bot(pub teloxide::Bot);
+pub struct Bot(pub adaptors::Throttle<teloxide::Bot>);
 
-impl From<teloxide::Bot> for Bot {
-    fn from(bot: teloxide::Bot) -> Self {
+impl From<adaptors::Throttle<teloxide::Bot>> for Bot {
+    fn from(bot: adaptors::Throttle<teloxide::Bot>) -> Self {
         Self(bot)
     }
 }
 
 impl Bot {
     pub fn from_env() -> Self {
-        Self(teloxide::Bot::from_env())
+        Self(teloxide::Bot::from_env().throttle(Default::default()))
     }
 
     pub async fn get_me(&self) -> Result<types::Me, teloxide::RequestError> {
@@ -42,14 +48,10 @@ impl Bot {
     ) -> HandlerResult<Message> {
         let text = text.into();
         log::debug!("Sending reply to message {reply_to} text:\n{text}");
-        let msg = <teloxide::Bot as Requester>::SendMessage::new(
-            self.0.clone(),
-            payloads::SendMessage {
-                reply_to_message_id: Some(reply_to),
-                ..payloads::SendMessage::new(chat_id.clone(), text)
-            },
-        )
-        .await?;
+        let mut pending_msg = self.0.send_message(chat_id.clone(), text);
+        let payload = pending_msg.payload_mut();
+        payload.reply_to_message_id = Some(reply_to);
+        let msg = pending_msg.await?;
 
         Ok(Message {
             bot: self.0.clone(),
@@ -83,7 +85,7 @@ impl Bot {
 
 #[derive(Clone)]
 pub struct Message {
-    bot: teloxide::Bot,
+    bot: adaptors::Throttle<teloxide::Bot>,
     msg_id: types::MessageId,
     chat_id: types::ChatId,
 }
